@@ -565,14 +565,29 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
         return true
     end
 
+    -- Pre-filter: try cache for each task (sequential cache check is fast)
     local pending = {}
-    local running = {}
-    local total = #tasks
-    local any_failed = false
-
-    for i, task in ipairs(tasks) do
-        table.insert(pending, { idx = i, task = task })
+    for _, task in ipairs(tasks) do
+        if not _SPKG_NO_CACHE then
+            spkg.cache_init()
+            local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                              spkg.fingerprint(task.source)
+            if spkg.cache_get(cache_key, task.output) then
+                if verbose then print("  [cache hit] " .. task.source) end
+                save_fingerprint(task.output, task.cflags)
+                -- skip, already cached
+            else
+                table.insert(pending, { task = task })
+            end
+        else
+            table.insert(pending, { task = task })
+        end
     end
+
+    if #pending == 0 then return true end
+
+    local running = {}
+    local any_failed = false
 
     local function start_next()
         while #pending > 0 and #running < max_jobs do
@@ -605,9 +620,14 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                 elseif verbose and result.out ~= "" then
                     print("    " .. result.out)
                 end
-                -- Save fingerprint on success
+                -- Save fingerprint and cache on success
                 if result.ok then
                     save_fingerprint(r.item.task.output, r.item.task.cflags)
+                    if not _SPKG_NO_CACHE then
+                        local cache_key = compute_fingerprint(r.item.task.cflags) .. "_" ..
+                                          spkg.fingerprint(r.item.task.source)
+                        spkg.cache_put(cache_key, r.item.task.output)
+                    end
                 end
             else
                 table.insert(new_running, r)
@@ -741,14 +761,19 @@ function M.run_first_artifact(extra_args)
                 return false
             end
 
-            -- Build command: ./exe + run_args + extra_args
+            -- Build command: exe + run_args + extra_args
             local args = {}
             for _, a in ipairs(art.run_args or {}) do table.insert(args, a) end
             if extra_args then
                 for _, a in ipairs(extra_args) do table.insert(args, a) end
             end
 
-            local cmd = "./" .. exe
+            local cmd
+            if is_windows() then
+                cmd = '"' .. exe .. '"'
+            else
+                cmd = "./" .. exe
+            end
             if #args > 0 then
                 cmd = cmd .. " " .. table.concat(args, " ")
             end

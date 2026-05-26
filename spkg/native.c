@@ -39,6 +39,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 
 #ifdef _WIN32
     #include <windows.h>
@@ -926,6 +927,15 @@ static int n_cache_init(lua_State *L) {
     return 1;
 }
 
+/* Helper: check if file exists (any file, not just executable) */
+static int file_exists_native(const char *path) {
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+    return access(path, F_OK) == 0;
+#endif
+}
+
 /* ── spkg.cache_get(key, output_path) → bool ───────────────────── */
 static int n_cache_get(lua_State *L) {
     const char *key = luaL_checkstring(L, 1);
@@ -941,13 +951,7 @@ static int n_cache_get(lua_State *L) {
     snprintf(cached_file, sizeof(cached_file), "%s/output.o", cache_dir_path);
 #endif
 
-    if (!is_executable(cached_file) &&
-#ifdef _WIN32
-        GetFileAttributesA(cached_file) == INVALID_FILE_ATTRIBUTES
-#else
-        access(cached_file, F_OK) != 0
-#endif
-    ) {
+    if (!file_exists_native(cached_file)) {
         lua_pushboolean(L, 0);
         return 1;
     }

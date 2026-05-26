@@ -234,15 +234,9 @@ function spkg_cmd_list()
 end
 
 function spkg_cmd_clean()
-    if spkg.dir_exists("build") then
-        spkg.run_cmd("rm -rf build")
-    end
-    if spkg.dir_exists("spkg_packages") then
-        spkg.run_cmd("rm -rf spkg_packages")
-    end
-    if spkg.file_exists("Sharp.lock") then
-        spkg.run_cmd("rm -f Sharp.lock")
-    end
+    if spkg.dir_exists("build") then spkg.remove("build") end
+    if spkg.dir_exists("spkg_packages") then spkg.remove("spkg_packages") end
+    if spkg.file_exists("Sharp.lock") then spkg.remove("Sharp.lock") end
     print("spkg: cleaned.")
     return true
 end
