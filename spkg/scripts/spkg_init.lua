@@ -11,6 +11,7 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no
     _SPKG_JOBS     = jobs
     _SPKG_HOME     = home
     _SPKG_NO_CACHE = no_cache or false
+    _SPKG_ARGS     = args or {}
 
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
         print([[
@@ -152,7 +153,7 @@ end
 function spkg_cmd_run()
     local ok = spkg_build.execute()
     if not ok then return false end
-    return spkg_build.run_first_artifact()
+    return spkg_build.run_first_artifact(_SPKG_ARGS)
 end
 
 function spkg_cmd_add(args)

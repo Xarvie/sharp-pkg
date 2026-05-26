@@ -825,7 +825,7 @@ function M.run_first_artifact(extra_args)
                 cmd = cmd .. " " .. table.concat(args, " ")
             end
 
-            if verbose then print("  [run] " .. cmd) end
+            if _SPKG_VERBOSE then print("  [run] " .. cmd) end
             local r = spkg.run_cmd(cmd)
             if r.out ~= "" then print(r.out) end
             return r.ok
