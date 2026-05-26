@@ -14,6 +14,7 @@
 - **零浪费编译** — 只做必要的编译，不多不少
 - **Windows 一等公民** — 不是"支持"，而是原生一等平台
 - **分布式就绪** — 架构设计原生支持分布式扩展
+- **C 核心，Lua 声明** — Lua 仅用于用户声明构建图（类似 zig 的 build.zig），所有执行逻辑在 C 层
 
 ---
 
@@ -22,9 +23,9 @@
 | Phase | 内容 | 状态 |
 |-------|------|------|
 | **Phase 1** | 声明式构建图、全平台 target、增量编译、cflags/ldflags | ✅ |
-| **Phase 1.5** | 头文件依赖追踪、Windows 一等公民、并行编译、错误提示改进 | ✅ |
-| **Phase 2** | 内容寻址编译缓存（sccache 模式）、DAG 拓扑排序、Custom Step | 规划中 |
-| **Phase 3** | 分布式编译（spkg-node + coordinator）、远程缓存 | 规划中 |
+| **Phase 1.5** | 头文件依赖追踪、Windows 一等公民、并行编译、DAG 拓扑排序、命令指纹 | ✅ |
+| **Phase 2** | 内容寻址编译缓存（local）、Custom Step、spkg cache 命令 | 开发中 |
+| **Phase 3** | 分布式编译（spkg-node + coordinator） | 规划中 |
 | **Phase 4** | 彩色诊断、测试框架 | 规划中 |
 
 ---
@@ -37,12 +38,18 @@
 │                                                                  │
 │  ┌───────────┐  ┌───────────┐  ┌──────────────────────────┐    │
 │  │  main.c   │  │ native.c  │  │   Lua Runtime (5.4)      │    │
-│  │ CLI/Args  │  │ Cross-plat│  │                          │    │
-│  │           │  │  System   │  │ spkg_init.lua            │    │
-│  │           │  │  API      │  │ spkg_build.lua           │    │
-│  │           │  │           │  │ spkg_fetch.lua           │    │
+│  │ CLI/Args  │  │ Core      │  │                          │    │
+│  │           │  │ Engine    │  │ spkg_init.lua            │    │
+│  │           │  │           │  │   (CLI dispatch)          │    │
+│  │           │  │ • Compile │  │                          │    │
+│  │           │  │ • Link    │  │ spkg_build.lua           │    │
+│  │           │  │ • Cache   │  │   (b API: user declares)  │    │
+│  │           │  │ • DAG     │  │                          │    │
+│  │           │  │ • Custom  │  │ spkg_fetch.lua           │    │
+│  │           │  │ Step      │  │   (dependency fetch)      │    │
+│  │           │  │           │  │                          │    │
 │  │           │  │           │  │ spkg_lock.lua            │    │
-│  │           │  │           │  │ spkg_resolve.lua         │    │
+│  │           │  │           │  │   (lockfile management)   │    │
 │  └───────────┘  └───────────┘  └──────────────────────────┘    │
 └────────────────────────┬────────────────────────────────────────┘
                          │ 加载
@@ -57,9 +64,12 @@
 
 | 层级 | 文件 | 职责 | 原则 |
 |------|------|------|------|
-| **声明层** | `Sharp.lua` | 声明工件、源文件、依赖关系 | 纯函数，无副作用 |
-| **执行层** | `spkg_build.lua` | 解析声明 → 构建 DAG → 调度编译 | 本地执行 or 分发到远程 |
+| **声明层** | `Sharp.lua` | 用户声明工件、源文件、依赖关系 | 纯函数，无副作用 |
+| **执行层** | `native.c` | 编译、链接、缓存、DAG、Custom Step | **所有核心逻辑在 C** |
 | **系统层** | `native.c` | 文件操作、进程执行、平台检测 | 跨平台封装（POSIX + Windows） |
+
+> **关键设计原则**：Lua 只负责 Sharp.lua 的用户声明 API（类似 zig 的 build.zig）。
+> 编译、链接、缓存、DAG 排序、并行调度等所有执行逻辑都在 native.c 实现，Lua 只通过 C 绑定调用。
 
 ---
 
@@ -217,7 +227,8 @@ build_graph = {
 
 ### 5.2 拓扑排序
 
-编译图按 DAG 拓扑排序后执行：
+Sharp.lua 声明完成后，spkg_build.lua 将构建图序列化并传递给 native.c 的 C 引擎。
+C 层执行 DAG 拓扑排序（Kahn 算法），确定编译顺序：
 1. `mathlib` 无依赖 → 最先编译
 2. `myapp` 依赖 `mathlib` → `mathlib` 完成后再链接
 
@@ -411,8 +422,9 @@ spkg build --optimize <level>    Debug | ReleaseSafe | ReleaseFast | ReleaseSmal
 spkg build --verbose             详细输出
 spkg build --all                 构建所有 targets
 spkg build --jobs <N>            并行编译数
+spkg build --no-cache            禁用缓存编译（Phase 2）
 spkg run                         构建 + 运行
-spkg test                        构建 + 运行测试
+spkg test                        构建 + 运行测试（Phase 4）
 spkg add <name> [version]        添加依赖
 spkg remove <name>               移除依赖
 spkg list                        列出依赖状态
@@ -480,7 +492,24 @@ return {
 | `spkg.wait_task(task_id)` | `{ok, out, code} | nil` | 检查任务完成状态（非阻塞） |
 | `spkg.execv(argv)` | `{ok, out, code}` | 直接执行，不经过 shell（Phase 2） |
 
-### 13.3 工具查找
+### 13.3 编译缓存（Phase 2）
+
+| 函数 | 返回 | 说明 |
+|------|------|------|
+| `spkg.cache_init()` | `bool` | 初始化缓存目录（`$HOME/.spkg-cache`） |
+| `spkg.cache_get(key)` | `bool` | 缓存命中 → 复制 .o 到 output_path |
+| `spkg.cache_put(key, file_path)` | `bool` | 将编译产物存入缓存 |
+| `spkg.cache_stats()` | `table` | `{hit, miss, size, count}` |
+| `spkg.cache_clear()` | `bool` | 清空缓存 |
+
+### 13.4 Custom Step（Phase 2）
+
+| 函数 | 返回 | 说明 |
+|------|------|------|
+| `spkg.custom_needs_run(inputs, outputs)` | `bool` | 判断是否需要执行自定义步骤 |
+| `spkg.custom_exec(command, workdir)` | `{ok, out, code}` | 执行自定义命令（argv 数组直接执行） |
+
+### 13.5 工具查找
 
 | 函数 | 返回 | 说明 |
 |------|------|------|
@@ -491,7 +520,7 @@ return {
 | `spkg.current_platform()` | `string` | 当前平台 target triple |
 | `spkg.fingerprint(data)` | `string` | SHA-256 哈希（Phase 2） |
 
-### 13.4 编译器查找优先级
+### 13.6 编译器查找优先级
 
 **sharpc:**
 1. `SHARPC` 环境变量
@@ -506,7 +535,7 @@ return {
 3. `{bin}/../zig/zig`（sharp 发行目录布局）
 4. PATH 中的 `zig`
 
-### 13.5 Windows 支持（一等公民）
+### 13.7 Windows 支持（一等公民）
 
 | 功能 | 实现 |
 |------|------|

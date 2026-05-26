@@ -438,6 +438,18 @@ local function compile_task_cmd(task, verbose)
 end
 
 local function compile_task(task, verbose)
+    -- Check cache first (unless --no-cache)
+    if not _SPKG_NO_CACHE then
+        spkg.cache_init()
+        local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                          spkg.fingerprint(task.source)
+        if spkg.cache_get(cache_key, task.output) then
+            if verbose then print("  [cache hit] " .. task.source) end
+            save_fingerprint(task.output, task.cflags)
+            return true
+        end
+    end
+
     local cmd = compile_task_cmd(task, verbose)
     if not cmd then
         print("spkg: no compiler found. Install sharpc or set SHARPC env var.")
@@ -451,6 +463,13 @@ local function compile_task(task, verbose)
     if not r.ok then
         print("    error:\n" .. r.out)
         return false
+    end
+
+    -- Save to cache (unless --no-cache)
+    if not _SPKG_NO_CACHE then
+        local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                          spkg.fingerprint(task.source)
+        spkg.cache_put(cache_key, task.output)
     end
 
     -- Save fingerprint on success

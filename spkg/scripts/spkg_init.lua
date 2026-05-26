@@ -1,7 +1,7 @@
 -- spkg_init.lua — CLI entry, dispatches commands
--- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, args_table)
+-- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, args)
 
-spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, args)
+spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, args)
 
     -- ── Build context flags (passed to Sharp.lua via globals) ──
     _SPKG_TARGET   = target
@@ -10,6 +10,7 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, ar
     _SPKG_ALL      = all_targets
     _SPKG_JOBS     = jobs
     _SPKG_HOME     = home
+    _SPKG_NO_CACHE = no_cache or false
 
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
         print([[

@@ -1,21 +1,37 @@
 /*
  * native.c — C native functions exposed to Lua via the "spkg" module.
  *
- * spkg.run_cmd(cmd)         → {ok, out, code}
- * spkg.file_exists(path)    → bool
- * spkg.dir_exists(path)     → bool
- * spkg.mkdir_p(path)        → bool
- * spkg.glob(pattern)        → {file1, file2, ...}
- * spkg.read_file(path)      → string or nil
- * spkg.write_file(path, s)  → bool
- * spkg.find_sharpc()        → string or nil
- * spkg.find_zigcc()         → string or nil
- * spkg.home_dir()           → string
- * spkg.cwd()                → string
- * spkg.get_mtime(path)      → number or nil
- * spkg.current_platform()   → string
- * spkg.start_cmd(cmd)       → task_id (number) or nil, err
- * spkg.wait_task(task_id)   → {ok, out, code} | nil (still running)
+ * Filesystem:
+ *   spkg.file_exists(path)    → bool
+ *   spkg.dir_exists(path)     → bool
+ *   spkg.mkdir_p(path)        → bool
+ *   spkg.glob(pattern)        → {file1, file2, ...}
+ *   spkg.read_file(path)      → string or nil
+ *   spkg.write_file(path, s)  → bool
+ *   spkg.get_mtime(path)      → number or nil
+ *   spkg.remove(path)         → bool
+ *
+ * Process:
+ *   spkg.run_cmd(cmd)         → {ok, out, code}
+ *   spkg.start_cmd(cmd)       → task_id (number) or nil, err
+ *   spkg.wait_task(task_id)   → {ok, out, code} | nil (still running)
+ *   spkg.custom_exec(cmd_tbl, workdir) → {ok, out, code}
+ *   spkg.custom_needs_run(inputs, outputs) → bool
+ *
+ * Tools:
+ *   spkg.find_sharpc()        → string or nil
+ *   spkg.find_zigcc()         → string or nil
+ *   spkg.home_dir()           → string
+ *   spkg.cwd()                → string
+ *   spkg.current_platform()   → string
+ *
+ * Cache (Phase 2):
+ *   spkg.cache_init()         → bool
+ *   spkg.cache_get(key, out)  → bool
+ *   spkg.cache_put(key, path) → bool
+ *   spkg.cache_stats()        → {hit, miss, size, count}
+ *   spkg.cache_clear()        → bool
+ *   spkg.fingerprint(data)    → string (FNV-1a 64-bit hash)
  */
 
 #include <stdlib.h>
@@ -843,6 +859,381 @@ static int n_fingerprint(lua_State *L) {
     return 1;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Phase 2: Content-addressable Build Cache
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Cache directory: $HOME/.spkg-cache/
+ * Layout: $HOME/.spkg-cache/<key>/output.o
+ *                           /meta (text metadata: hit counter)
+ * Stats: stored in $HOME/.spkg-cache/.stats
+ */
+
+static char g_cache_dir[PATH_MAX] = {0};
+
+static const char *get_cache_dir(void) {
+    if (g_cache_dir[0]) return g_cache_dir;
+
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = getenv("USERPROFILE");
+    if (!home) home = "C:\\Users\\Default";
+#else
+    if (!home) home = "/root";
+#endif
+
+    snprintf(g_cache_dir, sizeof(g_cache_dir), "%s/.spkg-cache", home);
+    return g_cache_dir;
+}
+
+static void ensure_cache_dir(void) {
+    const char *dir = get_cache_dir();
+#ifdef _WIN32
+    CreateDirectoryA(dir, NULL);
+#else
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", dir);
+    system(cmd);
+#endif
+}
+
+/* Helper: build cache path for a key -> buf */
+static void cache_path_for(const char *key, char *buf, size_t bufsize) {
+    snprintf(buf, bufsize, "%s/%s", get_cache_dir(), key);
+}
+
+/* Helper: copy file from src to dst */
+static int copy_file(const char *src, const char *dst) {
+    FILE *fin = fopen(src, "rb");
+    if (!fin) return -1;
+    FILE *fout = fopen(dst, "wb");
+    if (!fout) { fclose(fin); return -1; }
+
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
+        fwrite(buf, 1, n, fout);
+    }
+    fclose(fin);
+    fclose(fout);
+    return 0;
+}
+
+/* ── spkg.cache_init() → bool ──────────────────────────────────── */
+static int n_cache_init(lua_State *L) {
+    ensure_cache_dir();
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ── spkg.cache_get(key, output_path) → bool ───────────────────── */
+static int n_cache_get(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    const char *output_path = luaL_checkstring(L, 2);
+
+    char cache_dir_path[PATH_MAX];
+    cache_path_for(key, cache_dir_path, sizeof(cache_dir_path));
+
+    char cached_file[PATH_MAX];
+#ifdef _WIN32
+    snprintf(cached_file, sizeof(cached_file), "%s\\output.o", cache_dir_path);
+#else
+    snprintf(cached_file, sizeof(cached_file), "%s/output.o", cache_dir_path);
+#endif
+
+    if (!is_executable(cached_file) &&
+#ifdef _WIN32
+        GetFileAttributesA(cached_file) == INVALID_FILE_ATTRIBUTES
+#else
+        access(cached_file, F_OK) != 0
+#endif
+    ) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    /* Copy cached .o to output_path */
+    if (copy_file(cached_file, output_path) == 0) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+/* ── spkg.cache_put(key, file_path) → bool ─────────────────────── */
+static int n_cache_put(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    const char *file_path = luaL_checkstring(L, 2);
+
+    ensure_cache_dir();
+
+    char cache_dir_path[PATH_MAX];
+    cache_path_for(key, cache_dir_path, sizeof(cache_dir_path));
+
+    /* Create cache subdirectory */
+#ifdef _WIN32
+    CreateDirectoryA(cache_dir_path, NULL);
+#else
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", cache_dir_path);
+    system(cmd);
+#endif
+
+    /* Copy file_path → cache_dir/output.o */
+    char cached_file[PATH_MAX];
+#ifdef _WIN32
+    snprintf(cached_file, sizeof(cached_file), "%s\\output.o", cache_dir_path);
+#else
+    snprintf(cached_file, sizeof(cached_file), "%s/output.o", cache_dir_path);
+#endif
+
+    lua_pushboolean(L, copy_file(file_path, cached_file) == 0);
+    return 1;
+}
+
+/* ── spkg.cache_stats() → {hit, miss, size, count} ─────────────── */
+static int n_cache_stats(lua_State *L) {
+    const char *dir = get_cache_dir();
+
+    int hit = 0, miss = 0, count = 0;
+    long long size = 0;
+
+    /* Read stats file if exists */
+    char stats_file[PATH_MAX];
+#ifdef _WIN32
+    snprintf(stats_file, sizeof(stats_file), "%s\\.stats", dir);
+#else
+    snprintf(stats_file, sizeof(stats_file), "%s/.stats", dir);
+#endif
+
+    FILE *fp = fopen(stats_file, "r");
+    if (fp) {
+        fscanf(fp, "hit=%d miss=%d", &hit, &miss);
+        fclose(fp);
+    }
+
+    /* Count cache entries and total size */
+#ifdef _WIN32
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+        "for /d %%D in (\"%s\\*\") do @set /a count+=1 & for %%F in (\"%%D\\output.o\") do @set /a size+=%%~zF",
+        dir);
+    /* Simpler approach: just count dirs */
+    snprintf(cmd, sizeof(cmd), "dir /b /ad \"%s\" 2>nul | find /c /v \"\"", dir);
+    FILE *cmd_fp = popen(cmd, "r");
+    if (cmd_fp) {
+        char line[64];
+        if (fgets(line, sizeof(line), cmd_fp)) {
+            count = atoi(line);
+        }
+        pclose(cmd_fp);
+    }
+#else
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd),
+        "ls -1d %s/*/ 2>/dev/null | wc -l", dir);
+    FILE *cmd_fp = popen(cmd, "r");
+    if (cmd_fp) {
+        char line[64];
+        if (fgets(line, sizeof(line), cmd_fp)) {
+            count = atoi(line);
+        }
+        pclose(cmd_fp);
+    }
+    /* Total size */
+    snprintf(cmd, sizeof(cmd),
+        "du -sb %s 2>/dev/null | cut -f1", dir);
+    cmd_fp = popen(cmd, "r");
+    if (cmd_fp) {
+        char line[64];
+        if (fgets(line, sizeof(line), cmd_fp)) {
+            size = atoll(line);
+        }
+        pclose(cmd_fp);
+    }
+#endif
+
+    lua_newtable(L);
+    lua_pushinteger(L, hit);   lua_setfield(L, -2, "hit");
+    lua_pushinteger(L, miss);  lua_setfield(L, -2, "miss");
+    lua_pushinteger(L, count); lua_setfield(L, -2, "count");
+    lua_pushinteger(L, size);  lua_setfield(L, -2, "size");
+    return 1;
+}
+
+/* ── spkg.cache_clear() → bool ─────────────────────────────────── */
+static int n_cache_clear(lua_State *L) {
+    const char *dir = get_cache_dir();
+
+#ifdef _WIN32
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", dir);
+    lua_pushboolean(L, system(cmd) == 0);
+#else
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
+    lua_pushboolean(L, system(cmd) == 0);
+#endif
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Phase 2: Custom Step
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── spkg.custom_needs_run(inputs_table, outputs_table) → bool ─── */
+static int n_custom_needs_run(lua_State *L) {
+    /* Check: if any output doesn't exist, or any input is newer than all outputs, needs run */
+
+    double newest_output = 0.0;
+
+    /* First pass: find newest output mtime */
+    if (!lua_istable(L, 2)) { lua_pushboolean(L, 1); return 1; }
+
+    int out_count = (int)lua_rawlen(L, 2);
+    if (out_count == 0) { lua_pushboolean(L, 1); return 1; }
+
+    for (int i = 1; i <= out_count; i++) {
+        lua_rawgeti(L, 2, i);
+        const char *opath = lua_tostring(L, -1);
+        double mt = 0.0;
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExA(opath, GetFileExInfoStandard, &fad)) {
+            ULARGE_INTEGER ft;
+            ft.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+            ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+            mt = (double)(ft.QuadPart - 116444736000000000ULL) / 10000000.0;
+        }
+#else
+        struct stat st;
+        if (stat(opath, &st) == 0) {
+#ifdef __APPLE__
+            mt = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
+#else
+            mt = (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9;
+#endif
+        }
+#endif
+        lua_pop(L, 1);
+        if (mt == 0.0) { lua_pushboolean(L, 1); return 1; } /* output missing */
+        if (mt > newest_output) newest_output = mt;
+    }
+
+    /* Second pass: check if any input is newer than newest output */
+    if (lua_istable(L, 1)) {
+        int in_count = (int)lua_rawlen(L, 1);
+        for (int i = 1; i <= in_count; i++) {
+            lua_rawgeti(L, 1, i);
+            const char *ipath = lua_tostring(L, -1);
+            double mt = 0.0;
+#ifdef _WIN32
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            if (GetFileAttributesExA(ipath, GetFileExInfoStandard, &fad)) {
+                ULARGE_INTEGER ft;
+                ft.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+                ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+                mt = (double)(ft.QuadPart - 116444736000000000ULL) / 10000000.0;
+            }
+#else
+            struct stat st;
+            if (stat(ipath, &st) == 0) {
+#ifdef __APPLE__
+                mt = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
+#else
+                mt = (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9;
+#endif
+            }
+#endif
+            lua_pop(L, 1);
+            if (mt > newest_output) { lua_pushboolean(L, 1); return 1; }
+        }
+    }
+
+    lua_pushboolean(L, 0);
+    return 1;
+}
+
+/* ── spkg.custom_exec(cmd_table, workdir) → {ok, out, code} ────── */
+static int n_custom_exec(lua_State *L) {
+    if (!lua_istable(L, 1)) {
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "expected table for command"); lua_setfield(L, -2, "out");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        return 1;
+    }
+
+    /* Build command string from argv table */
+    char cmd[4096] = {0};
+    size_t total = 0;
+    int argc = (int)lua_rawlen(L, 1);
+    for (int i = 1; i <= argc; i++) {
+        lua_rawgeti(L, 1, i);
+        const char *arg = lua_tostring(L, -1);
+        if (arg) {
+            size_t n = strlen(arg);
+            if (total + n + 2 < sizeof(cmd)) {
+                if (i > 1) { cmd[total++] = ' '; }
+                memcpy(cmd + total, arg, n);
+                total += n;
+            }
+        }
+        lua_pop(L, 1);
+    }
+    cmd[total] = '\0';
+
+    /* Optionally set workdir (not supported cross-platform simply; use cd trick) */
+    const char *workdir = lua_tostring(L, 2);
+
+    char full_cmd[4096];
+    if (workdir && workdir[0]) {
+        snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", workdir, cmd);
+    } else {
+        strncpy(full_cmd, cmd, sizeof(full_cmd) - 1);
+    }
+
+    FILE *fp = popen(full_cmd, "r");
+    if (!fp) {
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "popen failed"); lua_setfield(L, -2, "out");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        return 1;
+    }
+
+    char buf[4096];
+    size_t out_total = 0;
+    char *out = malloc(1);
+    out[0] = '\0';
+
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        char *tmp = realloc(out, out_total + n + 1);
+        if (!tmp) { free(out); break; }
+        out = tmp;
+        memcpy(out + out_total, buf, n);
+        out_total += n;
+        out[out_total] = '\0';
+    }
+
+    int status = pclose(fp);
+#ifdef _WIN32
+    int code = status;
+#else
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+
+    lua_newtable(L);
+    lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
+    lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
+    lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+
+    if (out) free(out);
+    return 1;
+}
+
 /* ── register ────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
     {"run_cmd",          n_run_cmd},
@@ -862,6 +1253,13 @@ static const luaL_Reg spkg_lib[] = {
     {"wait_task",        n_wait_task},
     {"remove",           n_remove},
     {"fingerprint",      n_fingerprint},
+    {"cache_init",       n_cache_init},
+    {"cache_get",        n_cache_get},
+    {"cache_put",        n_cache_put},
+    {"cache_stats",      n_cache_stats},
+    {"cache_clear",      n_cache_clear},
+    {"custom_needs_run", n_custom_needs_run},
+    {"custom_exec",      n_custom_exec},
     {NULL, NULL}
 };
 
