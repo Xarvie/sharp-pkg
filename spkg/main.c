@@ -77,6 +77,7 @@ typedef struct {
     int         all_targets;  /* --all                   */
     int         jobs;         /* --jobs <N>              */
     int         no_cache;     /* --no-cache              */
+    int         distributed;  /* --dist                  */
     const char *extra_args[64];
     int         extra_count;
 } cli_args_t;
@@ -99,6 +100,8 @@ static void parse_cli(int argc, char **argv, cli_args_t *out) {
             out->jobs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-cache") == 0) {
             out->no_cache = 1;
+        } else if (strcmp(argv[i], "--dist") == 0) {
+            out->distributed = 1;
         } else if (argv[i][0] != '-') {
             if (!first_pos) {
                 out->cmd = argv[i];
@@ -152,6 +155,7 @@ int main(int argc, char **argv) {
     lua_pushboolean(L, cli.all_targets);
     lua_pushinteger(L, cli.jobs > 0 ? cli.jobs : 1);
     lua_pushboolean(L, cli.no_cache);
+    lua_pushboolean(L, cli.distributed);
 
     /* Push extra args as a table */
     lua_newtable(L);
@@ -160,7 +164,7 @@ int main(int argc, char **argv) {
         lua_rawseti(L, -2, i + 1);
     }
 
-    int rc = lua_pcall(L, 9, 1, 0);
+    int rc = lua_pcall(L, 10, 1, 0);
     if (rc != LUA_OK) {
         fprintf(stderr, "spkg: %s\n", lua_tostring(L, -1));
         goto fail;

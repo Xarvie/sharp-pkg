@@ -657,6 +657,174 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Distributed Compilation (Phase 3)
+-- ═══════════════════════════════════════════════════════════════
+
+local function parse_nodes()
+    local nodes = {}
+
+    -- Try SPKG_NODES environment variable first
+    local env_nodes = os.getenv("SPKG_NODES")
+    if env_nodes and env_nodes ~= "" then
+        for n in env_nodes:gmatch("([^,]+)") do
+            n = n:gsub("^%s+", ""):gsub("%s+$", "")
+            if n ~= "" then table.insert(nodes, n) end
+        end
+    end
+
+    -- Try spkg_nodes.json file
+    if #nodes == 0 and spkg.file_exists("spkg_nodes.json") then
+        local content = spkg.read_file("spkg_nodes.json")
+        if content then
+            for n in content:gmatch('"([^"]+)"') do
+                table.insert(nodes, n)
+            end
+        end
+    end
+
+    return nodes
+end
+
+-- Base64 decode (simple Lua implementation)
+local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function b64_decode(str)
+    local result = {}
+    local bits = 0
+    local val = 0
+    for i = 1, #str do
+        local c = str:sub(i, i)
+        if c == '=' then break end
+        local b = b64chars:find(c, 1, true)
+        if b then
+            b = b - 1
+            val = (val << 6) | b
+            bits = bits + 6
+            if bits >= 8 then
+                bits = bits - 8
+                table.insert(result, string.char((val >> bits) & 0xff))
+            end
+        end
+    end
+    return table.concat(result)
+end
+
+function M.execute_distributed(verbose, max_jobs)
+    local nodes = parse_nodes()
+    if #nodes == 0 then
+        print("spkg: no distributed nodes configured.")
+        print("  Set SPKG_NODES=node1:port,node2:port or create spkg_nodes.json")
+        print("  Falling back to local build.")
+        return M._do_build(verbose, max_jobs)
+    end
+
+    -- 0. Fetch dependencies
+    if not fetch_deps() then return false end
+
+    -- 1. Create build context
+    b = create_build_context()
+    local ok, err = pcall(dofile, "Sharp.lua")
+    if not ok then
+        print("spkg: error: failed to execute Sharp.lua")
+        print("  " .. tostring(err))
+        return false
+    end
+
+    -- 2. Build the graph
+    M.build_graph_from_ctx(b)
+
+    -- 2.5. Custom steps (always local)
+    if #b._custom_steps > 0 then
+        if verbose then print("spkg: executing custom steps...") end
+        if not execute_custom_steps(b._custom_steps, verbose) then return false end
+    end
+
+    print("spkg: distributed build with " .. #nodes .. " node(s)")
+    for _, n in ipairs(nodes) do print("  node: " .. n) end
+
+    -- 3. Execute each artifact
+    local node_idx = 0
+    for _, art in ipairs(build_graph.artifacts) do
+        if verbose then
+            print("spkg: building " .. art.name .. " [" .. art.type .. "]")
+        else
+            print("spkg: building " .. art.name .. " [" .. art.type .. "]")
+        end
+
+        for _, task in ipairs(art.compile_tasks) do
+            if needs_compile(task.source, task.output, task.cflags) then
+                spkg.mkdir_p("build/" .. art.name)
+
+                -- Read source file
+                local source = spkg.read_file(task.source)
+                if not source then
+                    print("  error: cannot read " .. task.source)
+                    return false
+                end
+
+                -- Pick a node (round-robin)
+                node_idx = (node_idx % #nodes) + 1
+                local node = nodes[node_idx]
+
+                -- Build JSON request
+                local cflags_json = "["
+                for i, f in ipairs(task.cflags) do
+                    if i > 1 then cflags_json = cflags_json .. "," end
+                    cflags_json = cflags_json .. '"' .. f .. '"'
+                end
+                cflags_json = cflags_json .. "]"
+
+                local opt = _SPKG_OPTIMIZE or "Debug"
+                local req = string.format(
+                    '{"source":%s,"cflags":%s,"optimize":"%s"}',
+                    '"' .. source:gsub('"', '\\"'):gsub('\n', '\\n') .. '"',
+                    cflags_json, opt)
+
+                -- Send to node
+                if verbose then print("  [remote] " .. task.source .. " -> " .. node)
+                else print("  [remote] " .. task.source) end
+
+                local url = "http://" .. node .. "/compile"
+                local r = spkg.http_post(url, req)
+
+                if not r.ok or r.code ~= 200 then
+                    print("  error: node " .. node .. " failed (code=" .. r.code .. ")")
+                    print("  " .. r.body)
+                    return false
+                end
+
+                -- Parse response
+                local output = r.body:match('"output":"([^"]*)"')
+                if output then
+                    local decoded = b64_decode(output)
+                    spkg.write_file(task.output, decoded)
+                    save_fingerprint(task.output, task.cflags)
+
+                    -- Write depfile if present
+                    local depfile = r.body:match('"depfile":"([^"]*)"')
+                    if depfile and depfile ~= "" then
+                        -- Unescape JSON string
+                        depfile = depfile:gsub("\\n", "\n"):gsub("\\\\", "\\")
+                        local dep_path = task.output:gsub("%.o$", "%.d")
+                        spkg.write_file(dep_path, depfile)
+                    end
+                else
+                    print("  error: no output from node")
+                    return false
+                end
+            else
+                if verbose then print("  [skip] " .. task.source .. " (up to date)") end
+            end
+        end
+
+        -- Link step (always local)
+        if not link_artifact(art, verbose) then return false end
+    end
+
+    print("spkg: done.")
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Custom Step Integration
 -- ═══════════════════════════════════════════════════════════════
 

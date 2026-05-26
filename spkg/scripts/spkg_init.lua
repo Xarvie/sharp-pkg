@@ -1,7 +1,7 @@
 -- spkg_init.lua — CLI entry, dispatches commands
--- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, args)
+-- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
-spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, args)
+spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
     -- ── Build context flags (passed to Sharp.lua via globals) ──
     _SPKG_TARGET   = target
@@ -11,6 +11,7 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no
     _SPKG_JOBS     = jobs
     _SPKG_HOME     = home
     _SPKG_NO_CACHE = no_cache or false
+    _SPKG_DIST     = dist or false
     _SPKG_ARGS     = args or {}
 
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
@@ -25,6 +26,7 @@ spkg — Sharp Package Manager
   spkg build --all                build all targets
   spkg build --jobs <N>           parallel compile jobs
   spkg build --no-cache           disable build cache
+  spkg build --dist               distributed build (requires spkg nodes)
   spkg run                        build + run executable
   spkg test                       build + run tests
   spkg add <name>                 add a dependency to SharpDeps.lua
@@ -147,11 +149,20 @@ return {}
 end
 
 function spkg_cmd_build()
-    return spkg_build.execute()
+    if _SPKG_DIST then
+        return spkg_build.execute_distributed(_SPKG_VERBOSE, _SPKG_JOBS or 1)
+    else
+        return spkg_build.execute()
+    end
 end
 
 function spkg_cmd_run()
-    local ok = spkg_build.execute()
+    local ok
+    if _SPKG_DIST then
+        ok = spkg_build.execute_distributed(_SPKG_VERBOSE, _SPKG_JOBS or 1)
+    else
+        ok = spkg_build.execute()
+    end
     if not ok then return false end
     return spkg_build.run_first_artifact(_SPKG_ARGS)
 end
