@@ -371,7 +371,11 @@ local function link_artifact(artifact, verbose)
     end
 
     spkg.mkdir_p("build/" .. name)
-    local inputs = table.concat(link.inputs, " ")
+    local inputs_list = {}
+    for _, inp in ipairs(link.inputs) do
+        table.insert(inputs_list, '"' .. inp .. '"')
+    end
+    local inputs = table.concat(inputs_list, " ")
     local ldflags = table.concat(link.ldflags, " ")
     local cmd = string.format('%s %s %s -o "%s"',
         compiler, inputs, ldflags, link.output)
@@ -419,17 +423,14 @@ function M.execute_single(verbose)
 end
 
 function M.execute_all_targets(verbose)
-    -- Determine targets from Sharp.lua
-    -- For now, if Sharp.lua defines targets, parse them; otherwise just build default
     local targets = M._discover_targets()
     if #targets <= 1 then
-        -- Only one or zero targets, build normally
         return M._do_build(verbose)
     end
 
-    for _, target in ipairs(targets) do
-        print(string.format("spkg: building target [%d/%d]: %s", _SPKG_build_idx or 1, #targets, target))
+    for i, target in ipairs(targets) do
         _SPKG_TARGET = target
+        print(string.format("spkg: building target [%d/%d]: %s", i, #targets, target))
         local ok = M._do_build(verbose)
         if not ok then
             print("spkg: failed to build target: " .. target)

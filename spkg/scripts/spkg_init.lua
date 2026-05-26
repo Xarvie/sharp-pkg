@@ -61,7 +61,7 @@ end
 -- Lua table serializer (for Sharp.lua init template)
 -- ═══════════════════════════════════════════════════════════════
 
-function spkg_dump_lua(val, indent)
+local function spkg_dump_lua(val, indent)
     indent = indent or 0
     local t = type(val)
     if t == "string" then return string.format("%q", val) end
@@ -115,7 +115,6 @@ local optimize = b:get_optimize()
 local exe = b:add_executable({ name = "%s" })
 exe:add_source({ file = "src/**/*.sp" })
 exe:add_include("src")
-exe:link_library("c")
 b:install(exe)
 ]]
     spkg.write_file("Sharp.lua", string.format(src, name))

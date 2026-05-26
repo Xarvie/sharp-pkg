@@ -75,6 +75,7 @@ end
 -- Clone a single dependency
 local function clone_dep(resolved, pkg_dir)
     if spkg.dir_exists(pkg_dir) then
+        print("  [cached] " .. resolved.name)
         return true  -- already cloned
     end
 
