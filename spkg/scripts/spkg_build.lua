@@ -378,7 +378,7 @@ local function link_artifact(artifact, verbose)
         return true
     end
 
-    -- exe or sharedlib: use zig cc
+    -- exe or sharedlib: link via compiler
     local compiler = find_compiler()
     if not compiler then
         print("spkg: no linker found.")
@@ -394,8 +394,8 @@ local function link_artifact(artifact, verbose)
     spkg.mkdir_p("build/" .. name)
     local inputs = table.concat(link.inputs, " ")
     local ldflags = table.concat(link.ldflags, " ")
-    local cmd = string.format('zig cc %s %s -o "%s"',
-        inputs, ldflags, link.output)
+    local cmd = string.format('%s %s %s -o "%s"',
+        compiler, inputs, ldflags, link.output)
 
     if verbose then print("    " .. cmd) end
 
@@ -414,7 +414,7 @@ end
 
 local function fetch_deps()
     local home = _SPKG_HOME or "/root"
-    if not spkg_fetch.fetch_deps(home) then
+    if not spkg_fetch.fetch_recursive(home) then
         return false
     end
     return true

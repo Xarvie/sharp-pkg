@@ -24,7 +24,6 @@
 #include <unistd.h>
 #include <glob.h>
 #include <errno.h>
-#include <time.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
