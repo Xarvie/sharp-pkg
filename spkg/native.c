@@ -19,12 +19,23 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <glob.h>
 #include <errno.h>
 #include <limits.h>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #include <io.h>
+    #define PATH_SEP '\\'
+    #define PATH_SEP_STR "\\"
+#else
+    #include <sys/stat.h>
+    #include <sys/types.h>
+    #include <unistd.h>
+    #include <glob.h>
+    #include <limits.h>
+    #define PATH_SEP '/'
+    #define PATH_SEP_STR "/"
+#endif
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -38,11 +49,16 @@
 
 /* Test whether a path is an executable file */
 static int is_executable(const char *path) {
+#ifdef _WIN32
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES &&
+           (GetFileAttributesA(path) & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+#endif
 }
 
-/* Resolve own exe path into buf (Linux: /proc/self/exe, macOS: _NSGetExecutablePath) */
+/* Resolve own exe path into buf */
 static const char *resolve_self_exe(char *buf, size_t bufsize) {
 #if defined(__linux__)
     ssize_t n = readlink("/proc/self/exe", buf, bufsize - 1);
@@ -53,13 +69,27 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
     #include <mach-o/dyld.h>
     uint32_t size = (uint32_t)bufsize;
     if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
-    /* Resolve symlinks */
     char *real = realpath(buf, buf);
     return real ? real : buf;
+#elif defined(_WIN32)
+    DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
+    if (len == 0 || len >= bufsize) return NULL;
+    return buf;
 #else
     (void)buf; (void)bufsize;
     return NULL;
 #endif
+}
+
+/* Find path separator (handles both / and \) */
+static char *find_path_sep(const char *path) {
+    char *last = NULL;
+    const char *p = path;
+    while (*p) {
+        if (*p == '/' || *p == '\\') last = (char *)p;
+        p++;
+    }
+    return last;
 }
 
 /* Try to find zig relative to self-exe, following sharp's layout:
@@ -71,29 +101,42 @@ static const char *find_zig_near_exe(void) {
     char self_exe[PATH_MAX];
     if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
 
-    char *slash = strrchr(self_exe, '/');
+    char *slash = find_path_sep(self_exe);
     if (!slash) return NULL;
     *slash = '\0';  /* self_dir */
     size_t dirlen = strlen(self_exe);
 
+#ifdef _WIN32
+    #define EXE_EXT ".exe"
+    const char *zig_name = "zig.exe";
+#else
+    #define EXE_EXT ""
+    const char *zig_name = "zig";
+#endif
+
     /* Priority 1a: {self_dir}/zig */
-    if (dirlen + 5 < sizeof(zig_path)) {
+    if (dirlen + 1 + strlen(zig_name) < sizeof(zig_path)) {
         memcpy(zig_path, self_exe, dirlen);
-        memcpy(zig_path + dirlen, "/zig", 5);
+        zig_path[dirlen] = PATH_SEP;
+        strcpy(zig_path + dirlen + 1, zig_name);
         if (is_executable(zig_path)) return zig_path;
     }
 
     /* Priority 1b: {self_dir}/../zig/zig */
-    char *parent_sep = strrchr(self_exe, '/');
+    char *parent_sep = find_path_sep(self_exe);
     if (parent_sep) {
         size_t pdirlen = (size_t)(parent_sep - self_exe);
-        if (pdirlen + 9 < sizeof(zig_path)) {
+        size_t need = pdirlen + 1 + strlen(zig_name) + 4 + 1; /* +4 for /zig/ */
+        if (need < sizeof(zig_path)) {
             memcpy(zig_path, self_exe, pdirlen);
-            memcpy(zig_path + pdirlen, "/zig/zig", 9);
+            zig_path[pdirlen] = PATH_SEP;
+            strcpy(zig_path + pdirlen + 1, "zig" PATH_SEP_STR);
+            strcat(zig_path, zig_name);
             if (is_executable(zig_path)) return zig_path;
         }
     }
 
+#undef EXE_EXT
     return NULL;
 }
 
@@ -125,8 +168,13 @@ static int n_run_cmd(lua_State *L) {
     }
 
     int status = pclose(fp);
+#ifdef _WIN32
+    int code = status;
+    int ok = (code == 0);
+#else
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     int ok = (code == 0);
+#endif
 
     lua_newtable(L);
     lua_pushboolean(L, ok);   lua_setfield(L, -2, "ok");
@@ -140,22 +188,40 @@ static int n_run_cmd(lua_State *L) {
 /* ── spkg.file_exists ────────────────────────────────────────────── */
 static int n_file_exists(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    lua_pushboolean(L, attr != INVALID_FILE_ATTRIBUTES &&
+                       (attr & FILE_ATTRIBUTE_DIRECTORY) == 0);
+#else
     struct stat st;
     lua_pushboolean(L, stat(path, &st) == 0 && S_ISREG(st.st_mode));
+#endif
     return 1;
 }
 
 /* ── spkg.dir_exists ─────────────────────────────────────────────── */
 static int n_dir_exists(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    lua_pushboolean(L, attr != INVALID_FILE_ATTRIBUTES &&
+                       (attr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+#else
     struct stat st;
     lua_pushboolean(L, stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+#endif
     return 1;
 }
 
 /* ── spkg.mkdir_p ────────────────────────────────────────────────── */
 static int n_mkdir_p(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd), "mkdir \"%s\" 2>nul || cd .", path);
+    int r = system(cmd);
+    lua_pushboolean(L, r == 0);
+#else
     struct stat st;
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
         lua_pushboolean(L, 1); return 1;
@@ -164,6 +230,7 @@ static int n_mkdir_p(lua_State *L) {
     snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
     int r = system(cmd);
     lua_pushboolean(L, r == 0);
+#endif
     return 1;
 }
 
@@ -171,6 +238,62 @@ static int n_mkdir_p(lua_State *L) {
 static int n_glob(lua_State *L) {
     const char *pattern = luaL_checkstring(L, 1);
 
+#ifdef _WIN32
+    /* Windows: use dir command via popen for ** patterns */
+    char cmd[4096];
+    /* Convert Lua glob pattern to Windows dir pattern */
+    char win_pattern[1024];
+    strncpy(win_pattern, pattern, sizeof(win_pattern) - 1);
+    win_pattern[sizeof(win_pattern) - 1] = '\0';
+    /* Replace / with \ */
+    for (char *p = win_pattern; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+    /* For ** patterns, use dir /s /b */
+    if (strstr(win_pattern, "**")) {
+        /* Extract base directory and filename pattern */
+        char base[1024] = ".";
+        const char *name = "*";
+        const char *dbl_star = strstr(win_pattern, "**");
+        if (dbl_star > win_pattern) {
+            size_t len = (size_t)(dbl_star - win_pattern);
+            if (len > 0 && (win_pattern[len - 1] == '\\' || win_pattern[len - 1] == '/')) len--;
+            if (len < sizeof(base)) {
+                memcpy(base, win_pattern, len);
+                base[len] = '\0';
+            }
+        }
+        const char *last_sep = find_path_sep(win_pattern);
+        if (last_sep && last_sep > dbl_star) name = last_sep + 1;
+
+        snprintf(cmd, sizeof(cmd), "dir /s /b \"%s\\%s\" 2>nul", base, name);
+    } else {
+        /* Simple glob: use dir /b */
+        snprintf(cmd, sizeof(cmd), "dir /b \"%s\" 2>nul", win_pattern);
+    }
+
+    FILE *fp = popen(cmd, "r");
+    lua_newtable(L);
+    if (fp) {
+        char line[4096];
+        int idx = 1;
+        while (fgets(line, sizeof(line), fp)) {
+            size_t ln = strlen(line);
+            if (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) {
+                line[ln - 1] = '\0';
+                if (ln > 1 && line[ln - 2] == '\r') line[ln - 2] = '\0';
+            }
+            /* Skip empty lines */
+            if (line[0]) {
+                lua_pushstring(L, line);
+                lua_rawseti(L, -2, idx++);
+            }
+        }
+        pclose(fp);
+    }
+    return 1;
+#else
+    char cmd[4096];
     if (strstr(pattern, "**")) {
         char base[1024] = ".";
         const char *name = "*";
@@ -186,7 +309,6 @@ static int n_glob(lua_State *L) {
         const char *last_slash = strrchr(pattern, '/');
         if (last_slash && last_slash > dbl_star) name = last_slash + 1;
 
-        char cmd[4096];
         snprintf(cmd, sizeof(cmd),
                  "find '%s' -name '%s' -type f 2>/dev/null", base, name);
         FILE *fp = popen(cmd, "r");
@@ -214,12 +336,13 @@ static int n_glob(lua_State *L) {
     }
     globfree(&g);
     return 1;
+#endif
 }
 
-/* ── spkg.read_file ────────────────────────────────────────────────── */
+/* ── spkg.read_file ──────────────────────────────────────────────── */
 static int n_read_file(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
-    FILE *fp = fopen(path, "r");
+    FILE *fp = fopen(path, "rb");
     if (!fp) { lua_pushnil(L); return 1; }
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp); rewind(fp);
@@ -227,24 +350,26 @@ static int n_read_file(lua_State *L) {
     if (!buf) { fclose(fp); lua_pushnil(L); return 1; }
     fread(buf, 1, sz, fp); buf[sz] = '\0';
     fclose(fp);
-    lua_pushstring(L, buf);
+    lua_pushlstring(L, buf, sz);
     free(buf);
     return 1;
 }
 
-/* ── spkg.write_file ───────────────────────────────────────────────── */
+/* ── spkg.write_file ─────────────────────────────────────────────── */
 static int n_write_file(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
-    const char *content = luaL_checkstring(L, 2);
-    FILE *fp = fopen(path, "w");
+    size_t len;
+    const char *content = lua_tolstring(L, 2, &len);
+    if (!content) { lua_pushboolean(L, 0); return 1; }
+    FILE *fp = fopen(path, "wb");
     if (!fp) { lua_pushboolean(L, 0); return 1; }
-    fputs(content, fp);
+    fwrite(content, 1, len, fp);
     fclose(fp);
     lua_pushboolean(L, 1);
     return 1;
 }
 
-/* ── spkg.find_sharpc ──────────────────────────────────────────────── */
+/* ── spkg.find_sharpc ────────────────────────────────────────────── */
 static int n_find_sharpc(lua_State *L) {
     /* 1. SHARPC env var */
     const char *env = getenv("SHARPC");
@@ -252,12 +377,22 @@ static int n_find_sharpc(lua_State *L) {
         lua_pushstring(L, env); return 1;
     }
 
-    /* 2. Search relative to spkg binary (via self-exe path) */
+    /* 2. Search relative to spkg binary */
     char self_exe[PATH_MAX];
     if (resolve_self_exe(self_exe, sizeof(self_exe))) {
-        char *slash = strrchr(self_exe, '/');
+        char *slash = find_path_sep(self_exe);
         if (slash) *slash = '\0';
+
         char cand[PATH_MAX];
+#ifdef _WIN32
+        const char *rel[] = {
+            "..\\..\\..\\build\\sharpc.exe",
+            "..\\..\\build\\sharpc.exe",
+            "..\\build\\sharpc.exe",
+            "..\\sharpc.exe",
+            NULL
+        };
+#else
         const char *rel[] = {
             "../../../build/sharpc",
             "../../build/sharpc",
@@ -265,8 +400,13 @@ static int n_find_sharpc(lua_State *L) {
             "../sharpc",
             NULL
         };
+#endif
         for (int i = 0; rel[i]; i++) {
+#ifdef _WIN32
+            snprintf(cand, sizeof(cand), "%s\\%s", self_exe, rel[i]);
+#else
             snprintf(cand, sizeof(cand), "%s/%s", self_exe, rel[i]);
+#endif
             if (is_executable(cand)) {
                 lua_pushstring(L, cand); return 1;
             }
@@ -277,7 +417,7 @@ static int n_find_sharpc(lua_State *L) {
     return 1;
 }
 
-/* ── spkg.find_zigcc ───────────────────────────────────────────────── */
+/* ── spkg.find_zigcc ─────────────────────────────────────────────── */
 static int n_find_zigcc(lua_State *L) {
     /* 1. ZIGCC env var */
     const char *env = getenv("ZIGCC");
@@ -292,12 +432,17 @@ static int n_find_zigcc(lua_State *L) {
     }
 
     /* 3. zig in PATH */
+#ifdef _WIN32
+    FILE *fp = popen("where zig.exe 2>nul", "r");
+#else
     FILE *fp = popen("which zig 2>/dev/null", "r");
+#endif
     if (fp) {
         char path[PATH_MAX] = "";
         if (fgets(path, sizeof(path), fp)) {
             size_t n = strlen(path);
-            if (n > 0 && path[n-1] == '\n') path[n-1] = '\0';
+            if (n > 0 && (path[n-1] == '\n' || path[n-1] == '\r')) path[n-1] = '\0';
+            if (n > 1 && path[n-2] == '\r') path[n-2] = '\0';
         }
         pclose(fp);
         if (path[0] && is_executable(path)) {
@@ -309,23 +454,53 @@ static int n_find_zigcc(lua_State *L) {
     return 1;
 }
 
-/* ── spkg.home_dir ─────────────────────────────────────────────────── */
+/* ── spkg.home_dir ───────────────────────────────────────────────── */
 static int n_home_dir(lua_State *L) {
     const char *h = getenv("HOME");
-    lua_pushstring(L, h ? h : "/root");
+#ifdef _WIN32
+    if (!h) h = getenv("USERPROFILE");
+    if (!h) h = "C:\\Users\\Default";
+#else
+    if (!h) h = "/root";
+#endif
+    lua_pushstring(L, h);
     return 1;
 }
 
-/* ── spkg.cwd ──────────────────────────────────────────────────────── */
+/* ── spkg.cwd ────────────────────────────────────────────────────── */
 static int n_cwd(lua_State *L) {
     char buf[PATH_MAX];
-    lua_pushstring(L, getcwd(buf, sizeof(buf)) ? buf : ".");
+#ifdef _WIN32
+    if (_getcwd(buf, sizeof(buf)))
+        lua_pushstring(L, buf);
+    else
+        lua_pushstring(L, ".");
+#else
+    if (getcwd(buf, sizeof(buf)))
+        lua_pushstring(L, buf);
+    else
+        lua_pushstring(L, ".");
+#endif
     return 1;
 }
 
-/* ── spkg.get_mtime ────────────────────────────────────────────────── */
+/* ── spkg.get_mtime ──────────────────────────────────────────────── */
 static int n_get_mtime(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    /* FILETIME is 100-nanosecond intervals since 1601-01-01 */
+    ULARGE_INTEGER ft;
+    ft.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    /* Convert to Unix timestamp (seconds since 1970-01-01) */
+    double seconds = (double)(ft.QuadPart - 116444736000000000ULL) / 10000000.0;
+    lua_pushnumber(L, seconds);
+#else
     struct stat st;
     if (stat(path, &st) != 0) {
         lua_pushnil(L);
@@ -336,10 +511,11 @@ static int n_get_mtime(lua_State *L) {
 #else
     lua_pushnumber(L, (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9);
 #endif
+#endif
     return 1;
 }
 
-/* ── spkg.current_platform ─────────────────────────────────────────── */
+/* ── spkg.current_platform ───────────────────────────────────────── */
 static int n_current_platform(lua_State *L) {
 #if defined(__linux__) && defined(__ANDROID__)
     #if defined(__aarch64__)
@@ -381,20 +557,20 @@ static int n_current_platform(lua_State *L) {
     return 1;
 }
 
-/* ── register ──────────────────────────────────────────────────────── */
+/* ── register ────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
-    {"run_cmd",         n_run_cmd},
-    {"file_exists",     n_file_exists},
-    {"dir_exists",      n_dir_exists},
-    {"mkdir_p",         n_mkdir_p},
-    {"glob",            n_glob},
-    {"read_file",       n_read_file},
-    {"write_file",      n_write_file},
-    {"find_sharpc",     n_find_sharpc},
-    {"find_zigcc",      n_find_zigcc},
-    {"home_dir",        n_home_dir},
-    {"cwd",             n_cwd},
-    {"get_mtime",       n_get_mtime},
+    {"run_cmd",          n_run_cmd},
+    {"file_exists",      n_file_exists},
+    {"dir_exists",       n_dir_exists},
+    {"mkdir_p",          n_mkdir_p},
+    {"glob",             n_glob},
+    {"read_file",        n_read_file},
+    {"write_file",       n_write_file},
+    {"find_sharpc",      n_find_sharpc},
+    {"find_zigcc",       n_find_zigcc},
+    {"home_dir",         n_home_dir},
+    {"cwd",              n_cwd},
+    {"get_mtime",        n_get_mtime},
     {"current_platform", n_current_platform},
     {NULL, NULL}
 };

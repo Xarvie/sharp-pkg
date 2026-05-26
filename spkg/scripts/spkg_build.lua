@@ -257,21 +257,69 @@ function M.build_graph_from_ctx(ctx)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Dependency File (.d) Parser
+-- ═══════════════════════════════════════════════════════════════
+
+-- Parse a Makefile-style .d file and return list of header file paths
+local function parse_depfile(path)
+    if not spkg.file_exists(path) then
+        return {}
+    end
+    local content = spkg.read_file(path)
+    if not content then return {} end
+
+    local headers = {}
+    -- Format: target.o: source.sp header1.h \
+    --           header2.h \
+    --           header3.h
+    -- Remove target: part, split by whitespace/backslash-newline
+    local deps_part = content:match(":[%s]*\n(.*)")
+    if not deps_part then
+        deps_part = content:match(":%s*(.*)")
+    end
+    if not deps_part then return {} end
+
+    -- Clean up: remove backslash-newline continuations
+    deps_part = deps_part:gsub("\\%s*\n", " ")
+    -- Split by whitespace
+    for h in deps_part:gmatch("%S+") do
+        if spkg.file_exists(h) then
+            table.insert(headers, h)
+        end
+    end
+    return headers
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Incremental Compilation Check
 -- ═══════════════════════════════════════════════════════════════
 
 local function needs_compile(source, output)
     local src_mtime = spkg.get_mtime(source)
     if not src_mtime then
-        -- Source deleted; clean up stale .o
+        -- Source deleted; clean up stale .o and .d
         if spkg.file_exists(output) then
             spkg.run_cmd("rm -f '" .. output .. "'")
+        end
+        local depfile = output:gsub("%.o$", ".d")
+        if spkg.file_exists(depfile) then
+            spkg.run_cmd("rm -f '" .. depfile .. "'")
         end
         return false
     end
 
     local out_mtime = spkg.get_mtime(output)
     if not out_mtime then return true end  -- output doesn't exist
+
+    -- Check if any included header is newer than .o
+    local depfile = output:gsub("%.o$", ".d")
+    local headers = parse_depfile(depfile)
+    for _, h in ipairs(headers) do
+        local h_mtime = spkg.get_mtime(h)
+        if h_mtime and h_mtime > out_mtime then
+            return true
+        end
+    end
 
     return src_mtime > out_mtime
 end
@@ -301,9 +349,11 @@ local function compile_task(task, verbose)
         print("  [sp] " .. task.source)
     end
 
+    -- Generate .d dependency file alongside .o
+    local depfile = task.output:gsub("%.o$", ".d")
     local cflags_str = table.concat(task.cflags, " ")
-    local cmd = string.format('%s %s "%s" -o "%s"',
-        compiler, cflags_str, task.source, task.output)
+    local cmd = string.format('%s %s -MMD -MF "%s" "%s" -o "%s"',
+        compiler, cflags_str, depfile, task.source, task.output)
 
     if verbose then print("  " .. cmd) end
 
@@ -448,7 +498,15 @@ function M._do_build(verbose)
     -- Load and run Sharp.lua
     local ok, err = pcall(dofile, "Sharp.lua")
     if not ok then
-        print("spkg: failed to load Sharp.lua: " .. tostring(err))
+        print("spkg: error: failed to execute Sharp.lua")
+        local msg = tostring(err)
+        -- Strip the file path prefix for cleaner output
+        local line_num = msg:match(":(%d+):")
+        if line_num then
+            print("  at line " .. line_num .. ": " .. msg:match(":(%d+: .*)"))
+        else
+            print("  " .. msg)
+        end
         return false
     end
 
