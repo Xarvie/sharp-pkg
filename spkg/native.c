@@ -898,6 +898,29 @@ static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
     }
 }
 
+/* Helper: build HTTP request string using mg_url parsing */
+static char *build_http_post(const char *url, const char *body, size_t *out_len) {
+    struct mg_str host = mg_url_host(url);
+    const char *uri = mg_url_uri(url);
+
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+              "POST %s HTTP/1.0\r\n"
+              "Host: %.*s\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %zu\r\n"
+              "\r\n",
+              uri, (int)host.len, host.buf, strlen(body));
+
+    *out_len = hlen + strlen(body);
+    char *req = (char *)malloc(*out_len + 1);
+    if (!req) return NULL;
+    memcpy(req, header, hlen);
+    memcpy(req + hlen, body, strlen(body));
+    req[*out_len] = '\0';
+    return req;
+}
+
 /* spkg.http_post(url, body) → {ok, body, code} */
 static int n_http_post(lua_State *L) {
     const char *url = luaL_checkstring(L, 1);
@@ -917,14 +940,12 @@ static int n_http_post(lua_State *L) {
         return 1;
     }
 
-    mg_printf(c,
-              "POST %s HTTP/1.0\r\n"
-              "Host: %s\r\n"
-              "Content-Type: application/json\r\n"
-              "Content-Length: %zu\r\n"
-              "\r\n"
-              "%s",
-              mg_url_uri(url), mg_url_host(url), strlen(body), body);
+    size_t req_len = 0;
+    char *req = build_http_post(url, body, &req_len);
+    if (req) {
+        mg_send(c, req, req_len);
+        free(req);
+    }
 
     /* Run event loop with timeout */
     int timeout_ms = 60000;  /* 60 seconds */
@@ -945,6 +966,26 @@ static int n_http_post(lua_State *L) {
     return 1;
 }
 
+/* Helper: build HTTP GET request string */
+static char *build_http_get(const char *url, size_t *out_len) {
+    struct mg_str host = mg_url_host(url);
+    const char *uri = mg_url_uri(url);
+
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+              "GET %s HTTP/1.0\r\n"
+              "Host: %.*s\r\n"
+              "\r\n",
+              uri, (int)host.len, host.buf);
+
+    *out_len = hlen;
+    char *req = (char *)malloc(*out_len + 1);
+    if (!req) return NULL;
+    memcpy(req, header, hlen);
+    req[*out_len] = '\0';
+    return req;
+}
+
 /* spkg.http_get(url) → {ok, body, code} */
 static int n_http_get(lua_State *L) {
     const char *url = luaL_checkstring(L, 1);
@@ -963,11 +1004,12 @@ static int n_http_get(lua_State *L) {
         return 1;
     }
 
-    mg_printf(c,
-              "GET %s HTTP/1.0\r\n"
-              "Host: %s\r\n"
-              "\r\n",
-              mg_url_uri(url), mg_url_host(url));
+    size_t req_len = 0;
+    char *req = build_http_get(url, &req_len);
+    if (req) {
+        mg_send(c, req, req_len);
+        free(req);
+    }
 
     int timeout_ms = 30000;  /* 30 seconds */
     while (!ctx.done) {
