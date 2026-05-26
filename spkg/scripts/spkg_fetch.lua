@@ -75,12 +75,12 @@ end
 -- Clone a single dependency
 local function clone_dep(resolved, pkg_dir)
     if spkg.dir_exists(pkg_dir) then
-        print("  [cached] " .. resolved.name)
+        print("  [cached] " .. (resolved.name or "unknown"))
         return true  -- already cloned
     end
 
     if not resolved or not resolved.url then
-        print("spkg: cannot resolve dependency: " .. resolved.name)
+        print("spkg: cannot resolve dependency: " .. (resolved and resolved.name or "unknown"))
         return false
     end
 

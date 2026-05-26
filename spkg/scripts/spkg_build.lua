@@ -423,26 +423,15 @@ function M.execute_single(verbose)
 end
 
 function M.execute_all_targets(verbose)
-    local targets = M._discover_targets()
-    if #targets <= 1 then
-        return M._do_build(verbose)
-    end
-
-    for i, target in ipairs(targets) do
-        _SPKG_TARGET = target
-        print(string.format("spkg: building target [%d/%d]: %s", i, #targets, target))
-        local ok = M._do_build(verbose)
-        if not ok then
-            print("spkg: failed to build target: " .. target)
-            return false
-        end
-    end
-    return true
+    -- Phase 1: Sharp.lua doesn't statically declare target list.
+    -- --all builds the current platform target.
+    -- Phase 2: Parse Sharp.lua for target declarations or read a targets list.
+    print("spkg: --all not yet supported (Sharp.lua doesn't declare static targets).")
+    return M._do_build(verbose)
 end
 
 function M._discover_targets()
-    -- Try to extract target list from Sharp.lua by looking for b:add_* calls
-    -- For Phase 1, just return the default target
+    -- Phase 1: returns current platform only
     return { spkg.current_platform() }
 end
 
