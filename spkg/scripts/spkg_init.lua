@@ -1,13 +1,14 @@
 -- spkg_init.lua — CLI entry, dispatches commands
 -- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, args_table)
 
-spkg_main = function(cmd, home, target, optimize, verbose, all_targets, args)
+spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, args)
 
     -- ── Build context flags (passed to Sharp.lua via globals) ──
     _SPKG_TARGET   = target
     _SPKG_OPTIMIZE = optimize
     _SPKG_VERBOSE  = verbose
     _SPKG_ALL      = all_targets
+    _SPKG_JOBS     = jobs
     _SPKG_HOME     = home
 
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
@@ -20,6 +21,7 @@ spkg — Sharp Package Manager
   spkg build --optimize <level>   Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
   spkg build --verbose            detailed output
   spkg build --all                build all targets
+  spkg build --jobs <N>           parallel compile jobs
   spkg run                        build + run executable
   spkg add <name>                 add a dependency to SharpDeps.lua
   spkg remove <name>              remove a dependency from SharpDeps.lua

@@ -5,7 +5,7 @@
 --   - Artifact objects (executable, staticlib, sharedlib)
 --   - Build Graph generation
 --   - Incremental compilation (mtime-based)
---   - Local execution (sharpc / zig cc)
+--   - Local execution with parallel compilation (--jobs)
 --
 -- Distributed compilation (Phase 2): build_graph is pure data, serializable.
 
@@ -269,19 +269,13 @@ local function parse_depfile(path)
     if not content then return {} end
 
     local headers = {}
-    -- Format: target.o: source.sp header1.h \
-    --           header2.h \
-    --           header3.h
-    -- Remove target: part, split by whitespace/backslash-newline
     local deps_part = content:match(":[%s]*\n(.*)")
     if not deps_part then
         deps_part = content:match(":%s*(.*)")
     end
     if not deps_part then return {} end
 
-    -- Clean up: remove backslash-newline continuations
     deps_part = deps_part:gsub("\\%s*\n", " ")
-    -- Split by whitespace
     for h in deps_part:gmatch("%S+") do
         if spkg.file_exists(h) then
             table.insert(headers, h)
@@ -297,7 +291,6 @@ end
 local function needs_compile(source, output)
     local src_mtime = spkg.get_mtime(source)
     if not src_mtime then
-        -- Source deleted; clean up stale .o and .d
         if spkg.file_exists(output) then
             spkg.run_cmd("rm -f '" .. output .. "'")
         end
@@ -309,9 +302,8 @@ local function needs_compile(source, output)
     end
 
     local out_mtime = spkg.get_mtime(output)
-    if not out_mtime then return true end  -- output doesn't exist
+    if not out_mtime then return true end
 
-    -- Check if any included header is newer than .o
     local depfile = output:gsub("%.o$", ".d")
     local headers = parse_depfile(depfile)
     for _, h in ipairs(headers) do
@@ -338,9 +330,21 @@ local function find_compiler()
     return nil
 end
 
-local function compile_task(task, verbose)
+local function compile_task_cmd(task, verbose)
     local compiler = find_compiler()
     if not compiler then
+        return nil
+    end
+
+    local depfile = task.output:gsub("%.o$", ".d")
+    local cflags_str = table.concat(task.cflags, " ")
+    return string.format('%s %s -MMD -MF "%s" "%s" -o "%s"',
+        compiler, cflags_str, depfile, task.source, task.output)
+end
+
+local function compile_task(task, verbose)
+    local cmd = compile_task_cmd(task, verbose)
+    if not cmd then
         print("spkg: no compiler found. Install sharpc or set SHARPC env var.")
         return false
     end
@@ -348,12 +352,6 @@ local function compile_task(task, verbose)
     if not verbose then
         print("  [sp] " .. task.source)
     end
-
-    -- Generate .d dependency file alongside .o
-    local depfile = task.output:gsub("%.o$", ".d")
-    local cflags_str = table.concat(task.cflags, " ")
-    local cmd = string.format('%s %s -MMD -MF "%s" "%s" -o "%s"',
-        compiler, cflags_str, depfile, task.source, task.output)
 
     if verbose then print("  " .. cmd) end
 
@@ -381,7 +379,6 @@ local function link_artifact(artifact, verbose)
     local atype = artifact.type
 
     if atype == "staticlib" then
-        -- Use zig ar (strong dependency on zig, as per sharp)
         local zig = spkg.find_zigcc()
         if not zig then
             print("spkg: zig not found (required for static library creation).")
@@ -446,6 +443,90 @@ local function link_artifact(artifact, verbose)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Parallel Compilation Engine
+-- ═══════════════════════════════════════════════════════════════
+
+local function compile_tasks_parallel(tasks, verbose, max_jobs)
+    if max_jobs <= 1 then
+        -- Sequential mode
+        for _, task in ipairs(tasks) do
+            if not compile_task(task, verbose) then
+                return false
+            end
+        end
+        return true
+    end
+
+    local pending = {}
+    local running = {}
+    local completed = 0
+    local total = #tasks
+    local any_failed = false
+
+    -- Initialize pending list
+    for i, task in ipairs(tasks) do
+        table.insert(pending, { idx = i, task = task })
+    end
+
+    -- Start initial batch
+    local function start_next()
+        while #pending > 0 and #running < max_jobs do
+            local item = table.remove(pending, 1)
+            local cmd = compile_task_cmd(item.task, verbose)
+            if not cmd then
+                any_failed = true
+                completed = total
+                return false
+            end
+            if not verbose then
+                print("  [sp] " .. item.task.source)
+            end
+            if verbose then print("  " .. cmd) end
+            local task_id, err = spkg.start_cmd(cmd)
+            if not task_id then
+                any_failed = true
+                print("    error: " .. err)
+                completed = total
+                return false
+            end
+            table.insert(running, { id = task_id, item = item })
+        end
+        return true
+    end
+
+    start_next()
+
+    -- Wait and manage
+    while #running > 0 do
+        -- Poll each running task
+        local new_running = {}
+        for _, r in ipairs(running) do
+            local result = spkg.wait_task(r.id)
+            if result then
+                completed = completed + 1
+                if not result.ok then
+                    any_failed = true
+                    print("    error:\n" .. result.out)
+                elseif verbose and result.out ~= "" then
+                    print("    " .. result.out)
+                end
+            else
+                -- Still running, keep it
+                table.insert(new_running, r)
+            end
+        end
+        running = new_running
+        -- Start more tasks if slots are available
+        if #running < max_jobs and #pending > 0 and not any_failed then
+            start_next()
+            if any_failed then break end
+        end
+    end
+
+    return not any_failed
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Dependency Fetching
 -- ═══════════════════════════════════════════════════════════════
 
@@ -464,24 +545,24 @@ end
 function M.execute()
     local verbose = (_SPKG_VERBOSE == true)
     local all_targets = (_SPKG_ALL == true)
+    local max_jobs = (_SPKG_JOBS and _SPKG_JOBS > 0) and _SPKG_JOBS or 1
 
     if all_targets then
-        return M.execute_all_targets(verbose)
+        return M.execute_all_targets(verbose, max_jobs)
     end
 
-    return M.execute_single(verbose)
+    return M.execute_single(verbose, max_jobs)
 end
 
-function M.execute_single(verbose)
-    return M._do_build(verbose)
+function M.execute_single(verbose, max_jobs)
+    return M._do_build(verbose, max_jobs)
 end
 
-function M.execute_all_targets(verbose)
+function M.execute_all_targets(verbose, max_jobs)
     -- Phase 1: Sharp.lua doesn't statically declare target list.
     -- --all builds the current platform target.
-    -- Phase 2: Parse Sharp.lua for target declarations or read a targets list.
     print("spkg: --all not yet supported (Sharp.lua doesn't declare static targets).")
-    return M._do_build(verbose)
+    return M._do_build(verbose, max_jobs)
 end
 
 function M._discover_targets()
@@ -489,8 +570,7 @@ function M._discover_targets()
     return { spkg.current_platform() }
 end
 
-function M._do_build(verbose)
-
+function M._do_build(verbose, max_jobs)
     -- 0. Fetch dependencies
     if not fetch_deps() then
         return false
@@ -504,7 +584,6 @@ function M._do_build(verbose)
     if not ok then
         print("spkg: error: failed to execute Sharp.lua")
         local msg = tostring(err)
-        -- Strip the file path prefix for cleaner output
         local line_num = msg:match(":(%d+):")
         if line_num then
             print("  at line " .. line_num .. ": " .. msg:match(":(%d+: .*)"))
@@ -527,24 +606,32 @@ function M._do_build(verbose)
             print("spkg: building " .. art.name .. " [" .. art.type .. "]")
         end
 
-        -- Compile tasks (incremental)
-        local compile_ok = true
+        -- Compile tasks (incremental, parallel if max_jobs > 1)
+        local compile_tasks = {}
+        local pending_tasks = {}
         for _, task in ipairs(art.compile_tasks) do
             if needs_compile(task.source, task.output) then
                 spkg.mkdir_p("build/" .. art.name)
-                if not compile_task(task, verbose) then
-                    compile_ok = false
-                    break
-                end
+                table.insert(pending_tasks, task)
             else
                 if verbose then
                     print("  [skip] " .. task.source .. " (up to date)")
                 end
+                -- Still add to compile_tasks for link step
+                table.insert(compile_tasks, task)
             end
         end
-        if not compile_ok then
-            all_ok = false
-            break
+
+        if #pending_tasks > 0 then
+            local compile_ok = compile_tasks_parallel(pending_tasks, verbose, max_jobs)
+            if not compile_ok then
+                all_ok = false
+                break
+            end
+            -- Add all tasks (including skipped ones) to compile_tasks
+            for _, task in ipairs(art.compile_tasks) do
+                table.insert(compile_tasks, task)
+            end
         end
 
         -- Link step

@@ -585,6 +585,128 @@ static int n_current_platform(lua_State *L) {
     return 1;
 }
 
+/* ── async command tracking (POSIX only) ─────────────────────────── */
+#ifndef _WIN32
+#include <sys/wait.h>
+
+#define MAX_ASYNC_CMDS 64
+static struct {
+    int pid;
+    int in_use;
+    char out_file[256];
+} async_cmds[MAX_ASYNC_CMDS];
+
+static int find_async_slot(void) {
+    for (int i = 0; i < MAX_ASYNC_CMDS; i++) {
+        if (!async_cmds[i].in_use) return i;
+    }
+    return -1;
+}
+
+/* ── spkg.start_cmd(cmd) → task_id (number) or nil ─────────────── */
+static int n_start_cmd(lua_State *L) {
+    const char *cmd = luaL_checkstring(L, 1);
+    int slot = find_async_slot();
+    if (slot < 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "too many async commands");
+        return 2;
+    }
+
+    /* Create temp file for output */
+    char tmpfile[] = "/tmp/spkg_cmd_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    if (fd < 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "cannot create temp file");
+        return 2;
+    }
+    close(fd);
+
+    /* Build command: cmd > tmpfile 2>&1 */
+    char full_cmd[4096];
+    snprintf(full_cmd, sizeof(full_cmd), "%s > '%s' 2>&1", cmd, tmpfile);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        remove(tmpfile);
+        lua_pushnil(L);
+        lua_pushliteral(L, "fork failed");
+        return 2;
+    }
+    if (pid == 0) {
+        /* Child */
+        execl("/bin/sh", "sh", "-c", full_cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent */
+    async_cmds[slot].pid = (int)pid;
+    async_cmds[slot].in_use = 1;
+    strncpy(async_cmds[slot].out_file, tmpfile, sizeof(async_cmds[slot].out_file) - 1);
+
+    lua_pushinteger(L, slot + 1);  /* 1-based ID */
+    return 1;
+}
+
+/* ── spkg.wait_task(task_id) → {ok, out, code} or nil ──────────── */
+static int n_wait_task(lua_State *L) {
+    int slot = (int)luaL_checkinteger(L, 1) - 1;  /* Convert to 0-based */
+    if (slot < 0 || slot >= MAX_ASYNC_CMDS || !async_cmds[slot].in_use) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    int status;
+    waitpid(async_cmds[slot].pid, &status, 0);
+    async_cmds[slot].in_use = 0;
+
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    /* Read output file */
+    FILE *fp = fopen(async_cmds[slot].out_file, "r");
+    char *out = NULL;
+    size_t total = 0;
+    if (fp) {
+        char buf[4096];
+        out = malloc(1);
+        out[0] = '\0';
+        while (fgets(buf, sizeof(buf), fp)) {
+            size_t n = strlen(buf);
+            char *tmp = realloc(out, total + n + 1);
+            if (!tmp) { free(out); break; }
+            out = tmp;
+            memcpy(out + total, buf, n);
+            total += n;
+            out[total] = '\0';
+        }
+        fclose(fp);
+    }
+
+    /* Clean up temp file */
+    remove(async_cmds[slot].out_file);
+
+    lua_newtable(L);
+    lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
+    lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
+    lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+
+    if (out) free(out);
+    return 1;
+}
+#else
+/* Windows stubs */
+static int n_start_cmd(lua_State *L) {
+    lua_pushnil(L);
+    lua_pushliteral(L, "async commands not supported on Windows");
+    return 2;
+}
+static int n_wait_task(lua_State *L) {
+    lua_pushnil(L);
+    return 1;
+}
+#endif
+
 /* ── register ────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
     {"run_cmd",          n_run_cmd},
@@ -600,6 +722,8 @@ static const luaL_Reg spkg_lib[] = {
     {"cwd",              n_cwd},
     {"get_mtime",        n_get_mtime},
     {"current_platform", n_current_platform},
+    {"start_cmd",        n_start_cmd},
+    {"wait_task",        n_wait_task},
     {NULL, NULL}
 };
 

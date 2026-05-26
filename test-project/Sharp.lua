@@ -1,0 +1,16 @@
+local target   = b:get_target()
+local optimize = b:get_optimize()
+
+-- 静态库
+local mathlib = b:add_static_library({ name = "mathlib" })
+mathlib:add_source({ file = "src/math.sp" })
+mathlib:add_include("src/include")
+b:install(mathlib)
+
+-- 可执行文件
+local exe = b:add_executable({ name = "test-app" })
+exe:add_source({ file = "src/main.sp" })
+exe:add_include("src")
+exe:add_include("src/include")
+exe:link_artifact(mathlib)
+b:install(exe)
