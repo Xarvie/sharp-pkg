@@ -25,8 +25,8 @@
 | **Phase 1** | 声明式构建图、全平台 target、增量编译、cflags/ldflags | ✅ |
 | **Phase 1.5** | 头文件依赖追踪、Windows 一等公民、并行编译、DAG 拓扑排序、命令指纹 | ✅ |
 | **Phase 2** | 内容寻址编译缓存（local）、Custom Step、spkg cache 命令 | ✅ |
-| **Phase 3** | 分布式编译（spkg-node + coordinator） | 规划中 |
-| **Phase 4** | 彩色诊断、测试框架 | 规划中 |
+| **Phase 3** | 分布式编译（spkg-node + coordinator） | ✅ |
+| **Phase 4** | 彩色诊断、测试框架 | 开发中 |
 
 ---
 

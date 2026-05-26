@@ -14,6 +14,9 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no
     _SPKG_DIST     = dist or false
     _SPKG_ARGS     = args or {}
 
+    -- Color helpers (only when output is a TTY)
+    local COLOR = spkg.is_tty() and spkg.colorize or function(t, _) return t end
+
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
         print([[
 spkg — Sharp Package Manager
@@ -132,7 +135,7 @@ exe:add_include("src")
 b:install(exe)
 ]]
     spkg.write_file("Sharp.lua", string.format(src, name))
-    print("spkg: created Sharp.lua")
+    print(ok_msg("spkg: created Sharp.lua"))
 
     if not spkg.file_exists("SharpDeps.lua") then
         local deps = [[-- SharpDeps.lua — Dependency declarations

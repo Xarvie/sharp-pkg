@@ -1030,6 +1030,92 @@ static int n_http_get(lua_State *L) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Phase 4: Colorized output
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ANSI color codes */
+static const char *color_codes[] = {
+    "",        /* 0: reset/default */
+    "\033[31m", /* 1: red */
+    "\033[32m", /* 2: green */
+    "\033[33m", /* 3: yellow */
+    "\033[34m", /* 4: blue */
+    "\033[35m", /* 5: magenta */
+    "\033[36m", /* 6: cyan */
+    "\033[1m",  /* 7: bold */
+    "\033[31;1m", /* 8: bold red */
+    "\033[32;1m", /* 9: bold green */
+    "\033[33;1m", /* 10: bold yellow */
+    "\033[34;1m", /* 11: bold blue */
+};
+static const int color_code_count = sizeof(color_codes) / sizeof(color_codes[0]);
+
+/* spkg.colorize(text, color_name) → string with ANSI codes */
+static int n_colorize(lua_State *L) {
+    const char *text = luaL_checkstring(L, 1);
+    const char *color_name = luaL_optstring(L, 2, "");
+    int color_idx = 0;
+
+    if (strcmp(color_name, "red") == 0) color_idx = 1;
+    else if (strcmp(color_name, "green") == 0) color_idx = 2;
+    else if (strcmp(color_name, "yellow") == 0) color_idx = 3;
+    else if (strcmp(color_name, "blue") == 0) color_idx = 4;
+    else if (strcmp(color_name, "magenta") == 0) color_idx = 5;
+    else if (strcmp(color_name, "cyan") == 0) color_idx = 6;
+    else if (strcmp(color_name, "bold") == 0) color_idx = 7;
+    else if (strcmp(color_name, "bold_red") == 0) color_idx = 8;
+    else if (strcmp(color_name, "bold_green") == 0) color_idx = 9;
+    else if (strcmp(color_name, "bold_yellow") == 0) color_idx = 10;
+    else if (strcmp(color_name, "bold_blue") == 0) color_idx = 11;
+
+    /* If not a TTY, return plain text */
+    if (color_idx == 0) {
+        lua_pushstring(L, text);
+        return 1;
+    }
+
+    char buf[4096];
+    const char *reset = "\033[0m";
+    snprintf(buf, sizeof(buf), "%s%s%s",
+             color_codes[color_idx], text, reset);
+    lua_pushstring(L, buf);
+    return 1;
+}
+
+/* spkg.is_tty() → bool */
+static int n_is_tty(lua_State *L) {
+#ifdef _WIN32
+    DWORD mode;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    lua_pushboolean(L, h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode));
+#else
+    lua_pushboolean(L, isatty(STDOUT_FILENO));
+#endif
+    return 1;
+}
+
+/* spkg.tty_width() → int */
+static int n_tty_width(lua_State *L) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (GetConsoleScreenBufferInfo(h, &csbi)) {
+        lua_pushinteger(L, csbi.srWindow.Right - csbi.srWindow.Left + 1);
+        return 1;
+    }
+#elif defined(TIOCGWINSZ)
+    #include <sys/ioctl.h>
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        lua_pushinteger(L, ws.ws_col);
+        return 1;
+    }
+#endif
+    lua_pushinteger(L, 80);  /* fallback */
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Phase 2: Content-addressable Build Cache
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -1435,6 +1521,9 @@ static const luaL_Reg spkg_lib[] = {
     {"custom_exec",      n_custom_exec},
     {"http_post",        n_http_post},
     {"http_get",         n_http_get},
+    {"colorize",         n_colorize},
+    {"is_tty",           n_is_tty},
+    {"tty_width",        n_tty_width},
     {NULL, NULL}
 };
 

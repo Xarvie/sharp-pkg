@@ -12,6 +12,26 @@
 
 local M = {}
 
+-- ═══════════════════════════════════════════════════════════════
+-- Color Helpers
+-- ═══════════════════════════════════════════════════════════════
+
+local COLOR = spkg.is_tty() and spkg.colorize or function(t, _) return t end
+
+local function status_color(name, text)
+    return string.format("  [%s] %s",
+                         COLOR(name, "bold_blue"),
+                         text)
+end
+
+local function error_msg(msg)
+    return COLOR("error: " .. msg, "bold_red")
+end
+
+local function warn_msg(msg)
+    return COLOR("warning: " .. msg, "bold_yellow")
+end
+
 -- ── Build Graph (populated after running Sharp.lua) ──
 local build_graph = { artifacts = {} }
 
@@ -469,12 +489,12 @@ local function compile_task(task, verbose)
         return false
     end
 
-    if not verbose then print("  [sp] " .. task.source) end
+    if not verbose then print(status_color("sp", task.source)) end
     if verbose then print("  " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
     if not r.ok then
-        print("    error:\n" .. r.out)
+        print(error_msg("compilation failed:\n" .. r.out))
         return false
     end
 
@@ -959,7 +979,7 @@ function M._do_build(verbose, max_jobs)
         end
     end
 
-    if all_ok then print("spkg: done.") end
+    if all_ok then print(COLOR("spkg: done.", "bold_green")) end
     return all_ok
 end
 
