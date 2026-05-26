@@ -13,8 +13,7 @@ local M = {}
 
 -- ── Build Graph (populated after running Sharp.lua) ──
 local build_graph = {
-    artifacts = {},    -- list of install artifacts
-    all_tasks = {},    -- flat list of all compile tasks
+    artifacts = {},
 }
 
 -- ═══════════════════════════════════════════════════════════════
@@ -23,10 +22,9 @@ local build_graph = {
 
 local function create_build_context()
     local ctx = {}
-    local artifacts = {}   -- all declared artifacts
-    local install_list = {} -- artifacts marked for install
+    local artifacts = {}
+    local install_list = {}
 
-    -- ── Query functions ──
     function ctx:get_target()
         if _SPKG_TARGET and _SPKG_TARGET ~= "" then
             return _SPKG_TARGET
@@ -42,7 +40,6 @@ local function create_build_context()
         return _SPKG_VERBOSE == true
     end
 
-    -- ── Optimize → sharpc flags ──
     local optimize_flags = {
         Debug       = "-O0",
         ReleaseSafe = "-O1",
@@ -50,20 +47,18 @@ local function create_build_context()
         ReleaseSmall = "-Os",
     }
 
-    -- ── Artifact factory ──
     local function create_artifact(name, atype)
         local art = {
-            name       = name,
-            type       = atype,  -- exe | staticlib | sharedlib
-            sources    = {},     -- { {file=..., cflags=..., include=...}, ... }
-            includes   = {},     -- global includes for this artifact
-            cflags     = {},     -- extra global cflags for this artifact
-            ldflags    = {},     -- extra ldflags for this artifact
-            link_libs  = {},     -- -l flags
-            link_deps  = {},     -- linked artifact references (names)
+            name      = name,
+            type      = atype,
+            sources   = {},
+            includes  = {},
+            cflags    = {},
+            ldflags   = {},
+            link_libs = {},
+            link_deps = {},
         }
 
-        -- ── Source methods ──
         function art:add_source(spec)
             if type(spec) == "string" then
                 table.insert(self.sources, { file = spec })
@@ -109,7 +104,6 @@ local function create_build_context()
         return art
     end
 
-    -- ── Public API ──
     function ctx:add_executable(opts)
         local name = opts and opts.name or "main"
         local art = create_artifact(name, "exe")
@@ -143,7 +137,6 @@ local function create_build_context()
         return nil
     end
 
-    -- ── Internal access (for spkg_build) ──
     ctx._artifacts = artifacts
     ctx._install_list = install_list
     ctx._optimize_flags = optimize_flags
@@ -168,7 +161,6 @@ end
 
 function M.build_graph_from_ctx(ctx)
     local target = ctx:get_target()
-    local verbose = ctx:get_verbose()
 
     build_graph = {
         target = target,
@@ -180,50 +172,37 @@ function M.build_graph_from_ctx(ctx)
 
     for _, art in ipairs(ctx._install_list) do
         local artifact_graph = {
-            name = art.name,
-            type = art.type,
-            target = target,
+            name          = art.name,
+            type          = art.type,
+            target        = target,
             compile_tasks = {},
-            link_step = {},
+            link_step     = {},
         }
 
-        -- Combine global includes + per-source includes
         for _, src_spec in ipairs(art.sources) do
             local files = resolve_files(src_spec.file)
-            if #files == 0 then
-                if verbose then
-                    print("  [warn] no files matched: " .. src_spec.file)
-                end
-            end
 
-            -- Build cflags for this source entry
             local src_cflags = { opt_flag }
-            -- global includes
             for _, inc in ipairs(art.includes) do
                 table.insert(src_cflags, "-I" .. inc)
             end
-            -- per-source includes
             if src_spec.include then
                 for _, inc in ipairs(src_spec.include) do
                     table.insert(src_cflags, "-I" .. inc)
                 end
             end
-            -- per-source cflags
             if src_spec.cflags then
                 for _, f in ipairs(src_spec.cflags) do
                     table.insert(src_cflags, f)
                 end
             end
-            -- global artifact cflags
             for _, f in ipairs(art.cflags) do
                 table.insert(src_cflags, f)
             end
 
             for _, fp in ipairs(files) do
-                -- Derive output path: build/<artifact_name>/<stem>.o
                 local stem = fp:gsub("%.sp$", ""):gsub("[/\\]", "_")
                 local output = "build/" .. art.name .. "/" .. stem .. ".o"
-
                 table.insert(artifact_graph.compile_tasks, {
                     source = fp,
                     output = output,
@@ -232,13 +211,11 @@ function M.build_graph_from_ctx(ctx)
             end
         end
 
-        -- Link step
+        -- Link inputs
         local all_inputs = {}
         for _, task in ipairs(artifact_graph.compile_tasks) do
             table.insert(all_inputs, task.output)
         end
-
-        -- Add linked artifact outputs
         for _, dep_name in ipairs(art.link_deps) do
             local dep_art = ctx:dependency(dep_name)
             if dep_art then
@@ -254,16 +231,10 @@ function M.build_graph_from_ctx(ctx)
             end
         end
 
-        -- ldflags
         local lflags = {}
-        for _, f in ipairs(art.ldflags) do
-            table.insert(lflags, f)
-        end
-        for _, lib in ipairs(art.link_libs) do
-            table.insert(lflags, "-l" .. lib)
-        end
+        for _, f in ipairs(art.ldflags) do table.insert(lflags, f) end
+        for _, lib in ipairs(art.link_libs) do table.insert(lflags, "-l" .. lib) end
 
-        -- Output path
         local output_path
         if art.type == "staticlib" then
             output_path = "build/" .. art.name .. "/lib" .. art.name .. ".a"
@@ -274,8 +245,8 @@ function M.build_graph_from_ctx(ctx)
         end
 
         artifact_graph.link_step = {
-            inputs = all_inputs,
-            output = output_path,
+            inputs  = all_inputs,
+            output  = output_path,
             ldflags = lflags,
         }
 
@@ -291,7 +262,13 @@ end
 
 local function needs_compile(source, output)
     local src_mtime = spkg.get_mtime(source)
-    if not src_mtime then return false end
+    if not src_mtime then
+        -- Source deleted; clean up stale .o
+        if spkg.file_exists(output) then
+            spkg.run_cmd("rm -f '" .. output .. "'")
+        end
+        return false
+    end
 
     local out_mtime = spkg.get_mtime(output)
     if not out_mtime then return true end  -- output doesn't exist
@@ -307,7 +284,6 @@ local function find_compiler()
     local sharpc = spkg.find_sharpc()
     if sharpc then return sharpc end
 
-    -- Fallback: try zig cc for C code if sharpc not found
     local zig = spkg.find_zigcc()
     if zig then return zig end
 
@@ -325,14 +301,11 @@ local function compile_task(task, verbose)
         print("  [sp] " .. task.source)
     end
 
-    -- Build command: sharpc <cflags> <source> -o <output>
     local cflags_str = table.concat(task.cflags, " ")
     local cmd = string.format('%s %s "%s" -o "%s"',
         compiler, cflags_str, task.source, task.output)
 
-    if verbose then
-        print("  " .. cmd)
-    end
+    if verbose then print("  " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
     if not r.ok then
@@ -358,7 +331,13 @@ local function link_artifact(artifact, verbose)
     local atype = artifact.type
 
     if atype == "staticlib" then
-        -- Use ar to create static library
+        -- Use zig ar (strong dependency on zig, as per sharp)
+        local zig = spkg.find_zigcc()
+        if not zig then
+            print("spkg: zig not found (required for static library creation).")
+            return false
+        end
+
         if verbose then
             print("  [ar] " .. link.output)
         else
@@ -367,7 +346,7 @@ local function link_artifact(artifact, verbose)
 
         spkg.mkdir_p("build/" .. name)
         local inputs = table.concat(link.inputs, " ")
-        local cmd = string.format('zig ar rcs "%s" %s', link.output, inputs)
+        local cmd = string.format('"%s" ar rcs "%s" %s', zig, link.output, inputs)
         if verbose then print("    " .. cmd) end
 
         local r = spkg.run_cmd(cmd)
@@ -409,7 +388,7 @@ local function link_artifact(artifact, verbose)
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- Dependency Fetching (before build)
+-- Dependency Fetching
 -- ═══════════════════════════════════════════════════════════════
 
 local function fetch_deps()
@@ -426,6 +405,11 @@ end
 
 function M.execute()
     local verbose = (_SPKG_VERBOSE == true)
+
+    -- 0. Fetch dependencies
+    if not fetch_deps() then
+        return false
+    end
 
     -- 1. Create build context and inject as global 'b' for Sharp.lua
     b = create_build_context()
@@ -484,29 +468,27 @@ function M.execute()
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- Run first artifact
+-- Run first executable artifact
 -- ═══════════════════════════════════════════════════════════════
 
 function M.run_first_artifact()
-    if #build_graph.artifacts == 0 then
-        print("spkg: no artifacts to run.")
-        return false
+    for _, art in ipairs(build_graph.artifacts) do
+        if art.type == "exe" then
+            local exe = art.link_step.output
+            if not spkg.file_exists(exe) then
+                print("spkg: executable not found: " .. exe)
+                return false
+            end
+            local r = spkg.run_cmd("./" .. exe)
+            if r.out ~= "" then print(r.out) end
+            return r.ok
+        end
     end
 
-    local art = build_graph.artifacts[1]
-    local exe = art.link_step.output
-
-    if not spkg.file_exists(exe) then
-        print("spkg: executable not found: " .. exe)
-        return false
-    end
-
-    local r = spkg.run_cmd("./" .. exe)
-    if r.out ~= "" then print(r.out) end
-    return r.ok
+    print("spkg: no executable artifact to run.")
+    return false
 end
 
--- Export build context creator for use in spkg_init
 M.create_build_context = create_build_context
 
 return M

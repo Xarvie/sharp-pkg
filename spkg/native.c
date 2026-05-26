@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <glob.h>
 #include <errno.h>
+#include <limits.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -33,32 +34,110 @@
 #include "lualib.h"
 #include "lauxlib.h"
 
-/* ── spkg.run_cmd ──────────────────────────────────────────────────── */
+/* ── helpers ──────────────────────────────────────────────────────── */
+
+/* Test whether a path is an executable file */
+static int is_executable(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
+/* Resolve own exe path into buf (Linux: /proc/self/exe, macOS: _NSGetExecutablePath) */
+static const char *resolve_self_exe(char *buf, size_t bufsize) {
+#if defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", buf, bufsize - 1);
+    if (n < 0) return NULL;
+    buf[n] = '\0';
+    return buf;
+#elif defined(__APPLE__)
+    #include <mach-o/dyld.h>
+    uint32_t size = (uint32_t)bufsize;
+    if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
+    /* Resolve symlinks */
+    char *real = realpath(buf, buf);
+    return real ? real : buf;
+#else
+    (void)buf; (void)bufsize;
+    return NULL;
+#endif
+}
+
+/* Try to find zig relative to self-exe, following sharp's layout:
+ *   {bin}/zig          (zig next to sharpc/spkg)
+ *   {bin}/../zig/zig   (zig in sibling directory)
+ * Returns static buffer or NULL. */
+static const char *find_zig_near_exe(void) {
+    static char zig_path[PATH_MAX];
+    char self_exe[PATH_MAX];
+    if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
+
+    char *slash = strrchr(self_exe, '/');
+    if (!slash) return NULL;
+    *slash = '\0';  /* self_dir */
+    size_t dirlen = strlen(self_exe);
+
+    /* Priority 1a: {self_dir}/zig */
+    if (dirlen + 5 < sizeof(zig_path)) {
+        memcpy(zig_path, self_exe, dirlen);
+        memcpy(zig_path + dirlen, "/zig", 5);
+        if (is_executable(zig_path)) return zig_path;
+    }
+
+    /* Priority 1b: {self_dir}/../zig/zig */
+    char *parent_sep = strrchr(self_exe, '/');
+    if (parent_sep) {
+        size_t pdirlen = (size_t)(parent_sep - self_exe);
+        if (pdirlen + 9 < sizeof(zig_path)) {
+            memcpy(zig_path, self_exe, pdirlen);
+            memcpy(zig_path + pdirlen, "/zig/zig", 9);
+            if (is_executable(zig_path)) return zig_path;
+        }
+    }
+
+    return NULL;
+}
+
+/* ── spkg.run_cmd ────────────────────────────────────────────────── */
 static int n_run_cmd(lua_State *L) {
     const char *cmd = luaL_checkstring(L, 1);
-    char buf[8192];
     FILE *fp = popen(cmd, "r");
     if (!fp) {
         lua_newtable(L);
         lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
-        lua_pushstring(L, "cannot execute"); lua_setfield(L, -2, "out");
+        lua_pushliteral(L, "popen failed"); lua_setfield(L, -2, "out");
         lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
         return 1;
     }
-    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
-    buf[n] = '\0';
-    int code = pclose(fp);
+
+    char buf[4096];
+    size_t total = 0;
+    char *out = malloc(1);
+    out[0] = '\0';
+
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        char *tmp = realloc(out, total + n + 1);
+        if (!tmp) { free(out); break; }
+        out = tmp;
+        memcpy(out + total, buf, n);
+        total += n;
+        out[total] = '\0';
+    }
+
+    int status = pclose(fp);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int ok = (code == 0);
+
     lua_newtable(L);
-    lua_pushboolean(L, code == 0);
-    lua_setfield(L, -2, "ok");
-    lua_pushstring(L, buf);
-    lua_setfield(L, -2, "out");
-    lua_pushinteger(L, code);
-    lua_setfield(L, -2, "code");
+    lua_pushboolean(L, ok);   lua_setfield(L, -2, "ok");
+    lua_pushstring(L, out);   lua_setfield(L, -2, "out");
+    lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+
+    free(out);
     return 1;
 }
 
-/* ── spkg.file_exists ──────────────────────────────────────────────── */
+/* ── spkg.file_exists ────────────────────────────────────────────── */
 static int n_file_exists(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
     struct stat st;
@@ -66,7 +145,7 @@ static int n_file_exists(lua_State *L) {
     return 1;
 }
 
-/* ── spkg.dir_exists ───────────────────────────────────────────────── */
+/* ── spkg.dir_exists ─────────────────────────────────────────────── */
 static int n_dir_exists(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
     struct stat st;
@@ -74,23 +153,24 @@ static int n_dir_exists(lua_State *L) {
     return 1;
 }
 
-/* ── spkg.mkdir_p ──────────────────────────────────────────────────── */
+/* ── spkg.mkdir_p ────────────────────────────────────────────────── */
 static int n_mkdir_p(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
-    char tmp[1024];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        lua_pushboolean(L, 1); return 1;
     }
-    lua_pushboolean(L, mkdir(tmp, 0755) == 0 || errno == EEXIST);
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
+    int r = system(cmd);
+    lua_pushboolean(L, r == 0);
     return 1;
 }
 
-/* ── spkg.glob ─────────────────────────────────────────────────────── */
+/* ── spkg.glob ───────────────────────────────────────────────────── */
 static int n_glob(lua_State *L) {
     const char *pattern = luaL_checkstring(L, 1);
 
-    /* POSIX glob() does not support **; fall back to find(1). */
     if (strstr(pattern, "**")) {
         char base[1024] = ".";
         const char *name = "*";
@@ -125,7 +205,6 @@ static int n_glob(lua_State *L) {
         return 1;
     }
 
-    /* Standard glob */
     glob_t g;
     int rc = glob(pattern, 0, NULL, &g);
     lua_newtable(L);
@@ -169,52 +248,63 @@ static int n_write_file(lua_State *L) {
 static int n_find_sharpc(lua_State *L) {
     /* 1. SHARPC env var */
     const char *env = getenv("SHARPC");
-    if (env) {
-        struct stat st;
-        if (stat(env, &st) == 0 && S_ISREG(st.st_mode)) {
-            lua_pushstring(L, env); return 1;
-        }
+    if (env && is_executable(env)) {
+        lua_pushstring(L, env); return 1;
     }
 
-    /* 2. Search relative to spkg binary location (via /proc/self/exe) */
-    char exe_path[1024];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-        char *slash = strrchr(exe_path, '/');
-        if (slash) *slash = '\0';  /* dirname */
-        char cand[1280];
-        const char *rel_paths[] = {
+    /* 2. Search relative to spkg binary (via self-exe path) */
+    char self_exe[PATH_MAX];
+    if (resolve_self_exe(self_exe, sizeof(self_exe))) {
+        char *slash = strrchr(self_exe, '/');
+        if (slash) *slash = '\0';
+        char cand[PATH_MAX];
+        const char *rel[] = {
             "../../../build/sharpc",
             "../../build/sharpc",
             "../build/sharpc",
             "../sharpc",
             NULL
         };
-        for (int i = 0; rel_paths[i]; i++) {
-            snprintf(cand, sizeof(cand), "%s/%s", exe_path, rel_paths[i]);
-            struct stat st;
-            if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
+        for (int i = 0; rel[i]; i++) {
+            snprintf(cand, sizeof(cand), "%s/%s", self_exe, rel[i]);
+            if (is_executable(cand)) {
                 lua_pushstring(L, cand); return 1;
             }
         }
     }
 
-    /* 3. not found */
     lua_pushnil(L);
     return 1;
 }
 
 /* ── spkg.find_zigcc ───────────────────────────────────────────────── */
 static int n_find_zigcc(lua_State *L) {
-    /* Try "zig cc" — zig handles the "cc" subcommand */
-    FILE *fp = popen("zig version 2>/dev/null", "r");
-    if (fp) {
-        char ver[64] = "";
-        fread(ver, 1, sizeof(ver) - 1, fp);
-        pclose(fp);
-        if (ver[0]) { lua_pushstring(L, "zig cc"); return 1; }
+    /* 1. ZIGCC env var */
+    const char *env = getenv("ZIGCC");
+    if (env && is_executable(env)) {
+        lua_pushstring(L, env); return 1;
     }
+
+    /* 2. zig next to spkg binary (sharp's bundling layout) */
+    const char *near = find_zig_near_exe();
+    if (near) {
+        lua_pushstring(L, near); return 1;
+    }
+
+    /* 3. zig in PATH */
+    FILE *fp = popen("which zig 2>/dev/null", "r");
+    if (fp) {
+        char path[PATH_MAX] = "";
+        if (fgets(path, sizeof(path), fp)) {
+            size_t n = strlen(path);
+            if (n > 0 && path[n-1] == '\n') path[n-1] = '\0';
+        }
+        pclose(fp);
+        if (path[0] && is_executable(path)) {
+            lua_pushstring(L, path); return 1;
+        }
+    }
+
     lua_pushnil(L);
     return 1;
 }
@@ -228,7 +318,7 @@ static int n_home_dir(lua_State *L) {
 
 /* ── spkg.cwd ──────────────────────────────────────────────────────── */
 static int n_cwd(lua_State *L) {
-    char buf[1024];
+    char buf[PATH_MAX];
     lua_pushstring(L, getcwd(buf, sizeof(buf)) ? buf : ".");
     return 1;
 }
@@ -310,6 +400,10 @@ static const luaL_Reg spkg_lib[] = {
 };
 
 void spkg_register_native(lua_State *L) {
-    luaL_newlib(L, spkg_lib);
+    lua_newtable(L);
+    for (int i = 0; spkg_lib[i].name; i++) {
+        lua_pushcfunction(L, spkg_lib[i].func);
+        lua_setfield(L, -2, spkg_lib[i].name);
+    }
     lua_setglobal(L, "spkg");
 }
