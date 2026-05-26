@@ -793,6 +793,56 @@ static int n_wait_task(lua_State *L) {
 }
 #endif
 
+/* ── spkg.remove ─────────────────────────────────────────────────── */
+static int n_remove(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    int r;
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        /* RemoveDirectoryA only works on empty dirs; use a simple recursive approach */
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", path);
+        r = system(cmd);
+    } else {
+        r = DeleteFileA(path) ? 0 : -1;
+    }
+    lua_pushboolean(L, r == 0);
+#else
+    int r = remove(path);
+    if (r != 0) {
+        /* Try as directory */
+        char cmd[1280];
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+        r = system(cmd);
+    }
+    lua_pushboolean(L, r == 0);
+#endif
+    return 1;
+}
+
+/* ── spkg.fingerprint ────────────────────────────────────────────── */
+/* Simple FNV-1a 64-bit hash (Phase 2 placeholder; real SHA-256 can be added later) */
+static int n_fingerprint(lua_State *L) {
+    size_t len;
+    const char *data = luaL_checklstring(L, 1, &len);
+
+    uint64_t hash = 0xcbf29ce484222325ULL;  /* FNV-1a 64-bit init */
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint64_t)(unsigned char)data[i];
+        hash *= 0x100000001b3ULL;            /* FNV-1a 64-bit prime */
+    }
+
+    char hex[17];
+    snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)hash);
+    lua_pushstring(L, hex);
+    return 1;
+}
+
 /* ── register ────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
     {"run_cmd",          n_run_cmd},
@@ -810,6 +860,8 @@ static const luaL_Reg spkg_lib[] = {
     {"current_platform", n_current_platform},
     {"start_cmd",        n_start_cmd},
     {"wait_task",        n_wait_task},
+    {"remove",           n_remove},
+    {"fingerprint",      n_fingerprint},
     {NULL, NULL}
 };
 

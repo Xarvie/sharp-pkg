@@ -53,6 +53,8 @@ spkg — Sharp Package Manager
         return spkg_cmd_list()
     elseif cmd == "clean" then
         return spkg_cmd_clean()
+    elseif cmd == "test" then
+        return spkg_cmd_test()
     else
         print("spkg: unknown command '" .. cmd .. "'. Try 'spkg help'.")
         return false
@@ -241,6 +243,12 @@ function spkg_cmd_clean()
         spkg.run_cmd("rm -f Sharp.lock")
     end
     print("spkg: cleaned.")
+    return true
+end
+
+function spkg_cmd_test()
+    -- Phase 4: test framework
+    print("spkg: test command not yet implemented (Phase 4).")
     return true
 end
 

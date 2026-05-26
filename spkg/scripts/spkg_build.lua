@@ -2,19 +2,46 @@
 --
 -- Implements:
 --   - Build Context (b object injected into Sharp.lua)
---   - Artifact objects (executable, staticlib, sharedlib)
---   - Build Graph generation
---   - Incremental compilation (mtime-based)
+--   - Artifact objects (exe, staticlib, sharedlib)
+--   - DAG-based build graph with topological sort
+--   - Platform-aware artifact naming (.exe/.lib/.dll)
+--   - Incremental compilation (mtime + depfile + fingerprint)
 --   - Local execution with parallel compilation (--jobs)
 --
--- Distributed compilation (Phase 2): build_graph is pure data, serializable.
+-- Distributed compilation (Phase 3): build_graph is pure data, serializable.
 
 local M = {}
 
 -- ── Build Graph (populated after running Sharp.lua) ──
-local build_graph = {
-    artifacts = {},
-}
+local build_graph = { artifacts = {} }
+
+-- ═══════════════════════════════════════════════════════════════
+-- Platform Helpers
+-- ═══════════════════════════════════════════════════════════════
+
+local function is_windows()
+    local plat = spkg.current_platform()
+    return plat:match("windows") or plat:match("mingw")
+end
+
+local function exe_suffix()
+    return is_windows() and ".exe" or ""
+end
+
+local function staticlib_name(name)
+    return is_windows() and (name .. ".lib") or ("lib" .. name .. ".a")
+end
+
+local function sharedlib_name(name)
+    return is_windows() and (name .. ".dll") or ("lib" .. name .. ".so")
+end
+
+local function artifact_output(art)
+    if art.type == "staticlib"  then return staticlib_name(art.name)
+    elseif art.type == "sharedlib" then return sharedlib_name(art.name)
+    else return art.name .. exe_suffix()
+    end
+end
 
 -- ═══════════════════════════════════════════════════════════════
 -- Build Context (the "b" object)
@@ -40,10 +67,18 @@ local function create_build_context()
         return _SPKG_VERBOSE == true
     end
 
+    function ctx:get_jobs()
+        return _SPKG_JOBS or 1
+    end
+
+    function ctx:get_host()
+        return spkg.current_platform()
+    end
+
     local optimize_flags = {
-        Debug       = "-O0",
-        ReleaseSafe = "-O1",
-        ReleaseFast = "-O2",
+        Debug        = "-O0",
+        ReleaseSafe  = "-O1",
+        ReleaseFast  = "-O2",
         ReleaseSmall = "-Os",
     }
 
@@ -57,6 +92,7 @@ local function create_build_context()
             ldflags   = {},
             link_libs = {},
             link_deps = {},
+            run_args  = {},
         }
 
         function art:add_source(spec)
@@ -98,6 +134,11 @@ local function create_build_context()
 
         function art:link_artifact(other_art)
             table.insert(self.link_deps, other_art.name)
+            return self
+        end
+
+        function art:set_run_args(...)
+            self.run_args = {...}
             return self
         end
 
@@ -145,7 +186,7 @@ local function create_build_context()
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- Build Graph Builder
+-- File Resolution
 -- ═══════════════════════════════════════════════════════════════
 
 local function resolve_files(file_pattern)
@@ -159,24 +200,83 @@ local function resolve_files(file_pattern)
     end
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- DAG Topological Sort
+-- ═══════════════════════════════════════════════════════════════
+
+-- Kahn's algorithm: sort artifacts so dependencies are built first
+local function topo_sort(artifacts)
+    local by_name = {}
+    local in_degree = {}
+    local reverse_deps = {}
+
+    for _, art in ipairs(artifacts) do
+        by_name[art.name] = art
+        in_degree[art.name] = 0
+        reverse_deps[art.name] = {}
+    end
+
+    -- in_degree[X] = number of artifacts that X depends on (within our list)
+    for _, art in ipairs(artifacts) do
+        for _, dep_name in ipairs(art.link_deps) do
+            if by_name[dep_name] then
+                in_degree[art.name] = in_degree[art.name] + 1
+                table.insert(reverse_deps[dep_name], art.name)
+            end
+        end
+    end
+
+    -- BFS: start with artifacts that have no dependencies
+    local queue = {}
+    for _, art in ipairs(artifacts) do
+        if in_degree[art.name] == 0 then
+            table.insert(queue, art.name)
+        end
+    end
+
+    local result = {}
+    local head = 1
+    while head <= #queue do
+        local name = queue[head]
+        head = head + 1
+        table.insert(result, by_name[name])
+        for _, dependent in ipairs(reverse_deps[name]) do
+            in_degree[dependent] = in_degree[dependent] - 1
+            if in_degree[dependent] == 0 then
+                table.insert(queue, dependent)
+            end
+        end
+    end
+
+    return result
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- Build Graph Builder
+-- ═══════════════════════════════════════════════════════════════
+
 function M.build_graph_from_ctx(ctx)
     local target = ctx:get_target()
 
     build_graph = {
-        target = target,
+        target   = target,
         optimize = ctx:get_optimize(),
         artifacts = {},
     }
 
     local opt_flag = ctx._optimize_flags[ctx:get_optimize()] or "-O0"
 
-    for _, art in ipairs(ctx._install_list) do
+    -- Topological sort to ensure correct build order
+    local sorted = topo_sort(ctx._install_list)
+
+    for _, art in ipairs(sorted) do
         local artifact_graph = {
             name          = art.name,
             type          = art.type,
             target        = target,
             compile_tasks = {},
             link_step     = {},
+            run_args      = art.run_args or {},
         }
 
         for _, src_spec in ipairs(art.sources) do
@@ -219,14 +319,7 @@ function M.build_graph_from_ctx(ctx)
         for _, dep_name in ipairs(art.link_deps) do
             local dep_art = ctx:dependency(dep_name)
             if dep_art then
-                local dep_out
-                if dep_art.type == "staticlib" then
-                    dep_out = "build/" .. dep_name .. "/lib" .. dep_name .. ".a"
-                elseif dep_art.type == "sharedlib" then
-                    dep_out = "build/" .. dep_name .. "/lib" .. dep_name .. ".so"
-                else
-                    dep_out = "build/" .. dep_name .. "/" .. dep_name
-                end
+                local dep_out = "build/" .. dep_name .. "/" .. artifact_output(dep_art)
                 table.insert(all_inputs, dep_out)
             end
         end
@@ -235,14 +328,7 @@ function M.build_graph_from_ctx(ctx)
         for _, f in ipairs(art.ldflags) do table.insert(lflags, f) end
         for _, lib in ipairs(art.link_libs) do table.insert(lflags, "-l" .. lib) end
 
-        local output_path
-        if art.type == "staticlib" then
-            output_path = "build/" .. art.name .. "/lib" .. art.name .. ".a"
-        elseif art.type == "sharedlib" then
-            output_path = "build/" .. art.name .. "/lib" .. art.name .. ".so"
-        else
-            output_path = "build/" .. art.name .. "/" .. art.name
-        end
+        local output_path = "build/" .. art.name .. "/" .. artifact_output(art)
 
         artifact_graph.link_step = {
             inputs  = all_inputs,
@@ -260,60 +346,73 @@ end
 -- Dependency File (.d) Parser
 -- ═══════════════════════════════════════════════════════════════
 
--- Parse a Makefile-style .d file and return list of header file paths
 local function parse_depfile(path)
-    if not spkg.file_exists(path) then
-        return {}
-    end
+    if not spkg.file_exists(path) then return {} end
     local content = spkg.read_file(path)
     if not content then return {} end
 
     local headers = {}
     local deps_part = content:match(":[%s]*\n(.*)")
-    if not deps_part then
-        deps_part = content:match(":%s*(.*)")
-    end
+    if not deps_part then deps_part = content:match(":%s*(.*)") end
     if not deps_part then return {} end
 
     deps_part = deps_part:gsub("\\%s*\n", " ")
     for h in deps_part:gmatch("%S+") do
-        if spkg.file_exists(h) then
-            table.insert(headers, h)
-        end
+        if spkg.file_exists(h) then table.insert(headers, h) end
     end
     return headers
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- Incremental Compilation Check
+-- Fingerprint (detect cflag/include changes)
 -- ═══════════════════════════════════════════════════════════════
 
-local function needs_compile(source, output)
+local function compute_fingerprint(cflags)
+    local sorted = {}
+    for _, f in ipairs(cflags) do table.insert(sorted, f) end
+    table.sort(sorted)
+    local raw = table.concat(sorted, "|")
+    return spkg.fingerprint(raw)
+end
+
+local function needs_compile(source, output, cflags)
     local src_mtime = spkg.get_mtime(source)
     if not src_mtime then
-        if spkg.file_exists(output) then
-            spkg.run_cmd("rm -f '" .. output .. "'")
-        end
-        local depfile = output:gsub("%.o$", ".d")
-        if spkg.file_exists(depfile) then
-            spkg.run_cmd("rm -f '" .. depfile .. "'")
-        end
+        -- Source was deleted; clean up artifacts
+        if spkg.file_exists(output) then spkg.remove(output) end
+        local depfile = output:gsub("%.o$", "%.d")
+        if spkg.file_exists(depfile) then spkg.remove(depfile) end
         return false
     end
 
     local out_mtime = spkg.get_mtime(output)
     if not out_mtime then return true end
 
-    local depfile = output:gsub("%.o$", ".d")
+    -- Check .d file for header dependencies
+    local depfile = output:gsub("%.o$", "%.d")
     local headers = parse_depfile(depfile)
     for _, h in ipairs(headers) do
         local h_mtime = spkg.get_mtime(h)
-        if h_mtime and h_mtime > out_mtime then
-            return true
-        end
+        if h_mtime and h_mtime > out_mtime then return true end
+    end
+
+    -- Check command fingerprint
+    local fp_file = output .. ".fp"
+    local new_fp = compute_fingerprint(cflags or {})
+    if spkg.file_exists(fp_file) then
+        local old_fp = spkg.read_file(fp_file)
+        if old_fp ~= new_fp then return true end
+    else
+        return true  -- no fingerprint file = first compile
     end
 
     return src_mtime > out_mtime
+end
+
+local function save_fingerprint(output, cflags)
+    local fp_file = output .. ".fp"
+    local fp = compute_fingerprint(cflags or {})
+    spkg.write_file(fp_file, fp)
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -323,20 +422,16 @@ end
 local function find_compiler()
     local sharpc = spkg.find_sharpc()
     if sharpc then return sharpc end
-
     local zig = spkg.find_zigcc()
     if zig then return zig end
-
     return nil
 end
 
 local function compile_task_cmd(task, verbose)
     local compiler = find_compiler()
-    if not compiler then
-        return nil
-    end
+    if not compiler then return nil end
 
-    local depfile = task.output:gsub("%.o$", ".d")
+    local depfile = task.output:gsub("%.o$", "%.d")
     local cflags_str = table.concat(task.cflags, " ")
     return string.format('%s %s -MMD -MF "%s" "%s" -o "%s"',
         compiler, cflags_str, depfile, task.source, task.output)
@@ -349,10 +444,7 @@ local function compile_task(task, verbose)
         return false
     end
 
-    if not verbose then
-        print("  [sp] " .. task.source)
-    end
-
+    if not verbose then print("  [sp] " .. task.source) end
     if verbose then print("  " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
@@ -361,10 +453,10 @@ local function compile_task(task, verbose)
         return false
     end
 
-    if verbose and r.out ~= "" then
-        print("    " .. r.out)
-    end
+    -- Save fingerprint on success
+    save_fingerprint(task.output, task.cflags)
 
+    if verbose and r.out ~= "" then print("    " .. r.out) end
     return true
 end
 
@@ -388,7 +480,7 @@ local function link_artifact(artifact, verbose)
         if verbose then
             print("  [ar] " .. link.output)
         else
-            print("  [ar] lib" .. name .. ".a")
+            print("  [ar] " .. artifact_output(artifact))
         end
 
         spkg.mkdir_p("build/" .. name)
@@ -418,7 +510,7 @@ local function link_artifact(artifact, verbose)
     if verbose then
         print("  [link] " .. link.output)
     else
-        print("  [link] " .. name)
+        print("  [link] " .. artifact_output(artifact))
     end
 
     spkg.mkdir_p("build/" .. name)
@@ -448,45 +540,32 @@ end
 
 local function compile_tasks_parallel(tasks, verbose, max_jobs)
     if max_jobs <= 1 then
-        -- Sequential mode
         for _, task in ipairs(tasks) do
-            if not compile_task(task, verbose) then
-                return false
-            end
+            if not compile_task(task, verbose) then return false end
         end
         return true
     end
 
     local pending = {}
     local running = {}
-    local completed = 0
     local total = #tasks
     local any_failed = false
 
-    -- Initialize pending list
     for i, task in ipairs(tasks) do
         table.insert(pending, { idx = i, task = task })
     end
 
-    -- Start initial batch
     local function start_next()
         while #pending > 0 and #running < max_jobs do
             local item = table.remove(pending, 1)
             local cmd = compile_task_cmd(item.task, verbose)
-            if not cmd then
-                any_failed = true
-                completed = total
-                return false
-            end
-            if not verbose then
-                print("  [sp] " .. item.task.source)
-            end
+            if not cmd then any_failed = true; return false end
+            if not verbose then print("  [sp] " .. item.task.source) end
             if verbose then print("  " .. cmd) end
             local task_id, err = spkg.start_cmd(cmd)
             if not task_id then
                 any_failed = true
                 print("    error: " .. err)
-                completed = total
                 return false
             end
             table.insert(running, { id = task_id, item = item })
@@ -496,27 +575,26 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
 
     start_next()
 
-    -- Wait and manage
     while #running > 0 do
-        -- Poll each running task
         local new_running = {}
         for _, r in ipairs(running) do
             local result = spkg.wait_task(r.id)
             if result then
-                completed = completed + 1
                 if not result.ok then
                     any_failed = true
                     print("    error:\n" .. result.out)
                 elseif verbose and result.out ~= "" then
                     print("    " .. result.out)
                 end
+                -- Save fingerprint on success
+                if result.ok then
+                    save_fingerprint(r.item.task.output, r.item.task.cflags)
+                end
             else
-                -- Still running, keep it
                 table.insert(new_running, r)
             end
         end
         running = new_running
-        -- Start more tasks if slots are available
         if #running < max_jobs and #pending > 0 and not any_failed then
             start_next()
             if any_failed then break end
@@ -532,9 +610,7 @@ end
 
 local function fetch_deps()
     local home = _SPKG_HOME or "/root"
-    if not spkg_fetch.fetch_recursive(home) then
-        return false
-    end
+    if not spkg_fetch.fetch_recursive(home) then return false end
     return true
 end
 
@@ -550,7 +626,6 @@ function M.execute()
     if all_targets then
         return M.execute_all_targets(verbose, max_jobs)
     end
-
     return M.execute_single(verbose, max_jobs)
 end
 
@@ -566,20 +641,16 @@ function M.execute_all_targets(verbose, max_jobs)
 end
 
 function M._discover_targets()
-    -- Phase 1: returns current platform only
     return { spkg.current_platform() }
 end
 
 function M._do_build(verbose, max_jobs)
     -- 0. Fetch dependencies
-    if not fetch_deps() then
-        return false
-    end
+    if not fetch_deps() then return false end
 
-    -- 1. Create build context and inject as global 'b' for Sharp.lua
+    -- 1. Create build context and inject as global 'b'
     b = create_build_context()
 
-    -- Load and run Sharp.lua
     local ok, err = pcall(dofile, "Sharp.lua")
     if not ok then
         print("spkg: error: failed to execute Sharp.lua")
@@ -593,10 +664,10 @@ function M._do_build(verbose, max_jobs)
         return false
     end
 
-    -- 2. Build the graph
+    -- 2. Build the graph (DAG sorted)
     M.build_graph_from_ctx(b)
 
-    -- 3. Execute each artifact
+    -- 3. Execute each artifact in topological order
     local all_ok = true
     for _, art in ipairs(build_graph.artifacts) do
         if verbose then
@@ -606,19 +677,16 @@ function M._do_build(verbose, max_jobs)
             print("spkg: building " .. art.name .. " [" .. art.type .. "]")
         end
 
-        -- Compile tasks (incremental, parallel if max_jobs > 1)
-        local compile_tasks = {}
+        -- Separate pending vs up-to-date tasks
         local pending_tasks = {}
         for _, task in ipairs(art.compile_tasks) do
-            if needs_compile(task.source, task.output) then
+            if needs_compile(task.source, task.output, task.cflags) then
                 spkg.mkdir_p("build/" .. art.name)
                 table.insert(pending_tasks, task)
             else
                 if verbose then
                     print("  [skip] " .. task.source .. " (up to date)")
                 end
-                -- Still add to compile_tasks for link step
-                table.insert(compile_tasks, task)
             end
         end
 
@@ -627,10 +695,6 @@ function M._do_build(verbose, max_jobs)
             if not compile_ok then
                 all_ok = false
                 break
-            end
-            -- Add all tasks (including skipped ones) to compile_tasks
-            for _, task in ipairs(art.compile_tasks) do
-                table.insert(compile_tasks, task)
             end
         end
 
@@ -641,9 +705,7 @@ function M._do_build(verbose, max_jobs)
         end
     end
 
-    if all_ok then
-        print("spkg: done.")
-    end
+    if all_ok then print("spkg: done.") end
     return all_ok
 end
 
@@ -651,7 +713,7 @@ end
 -- Run first executable artifact
 -- ═══════════════════════════════════════════════════════════════
 
-function M.run_first_artifact()
+function M.run_first_artifact(extra_args)
     for _, art in ipairs(build_graph.artifacts) do
         if art.type == "exe" then
             local exe = art.link_step.output
@@ -659,7 +721,21 @@ function M.run_first_artifact()
                 print("spkg: executable not found: " .. exe)
                 return false
             end
-            local r = spkg.run_cmd("./" .. exe)
+
+            -- Build command: ./exe + run_args + extra_args
+            local args = {}
+            for _, a in ipairs(art.run_args or {}) do table.insert(args, a) end
+            if extra_args then
+                for _, a in ipairs(extra_args) do table.insert(args, a) end
+            end
+
+            local cmd = "./" .. exe
+            if #args > 0 then
+                cmd = cmd .. " " .. table.concat(args, " ")
+            end
+
+            if verbose then print("  [run] " .. cmd) end
+            local r = spkg.run_cmd(cmd)
             if r.out ~= "" then print(r.out) end
             return r.ok
         end
