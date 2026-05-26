@@ -14,6 +14,8 @@
  * spkg.cwd()                → string
  * spkg.get_mtime(path)      → number or nil
  * spkg.current_platform()   → string
+ * spkg.start_cmd(cmd)       → task_id (number) or nil, err
+ * spkg.wait_task(task_id)   → {ok, out, code} | nil (still running)
  */
 
 #include <stdlib.h>
@@ -33,6 +35,7 @@
     #include <unistd.h>
     #include <glob.h>
     #include <limits.h>
+    #include <sys/wait.h>
     #define PATH_SEP '/'
     #define PATH_SEP_STR "/"
 #endif
@@ -69,7 +72,6 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
 #elif defined(__APPLE__)
     uint32_t size = (uint32_t)bufsize;
     if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
-    /* Resolve symlinks using a separate temp buffer */
     char tmp[PATH_MAX];
     char *real = realpath(buf, tmp);
     if (real) {
@@ -97,10 +99,7 @@ static const char *find_path_sep(const char *path) {
     return last;
 }
 
-/* Try to find zig relative to self-exe, following sharp's layout:
- *   {bin}/zig          (zig next to sharpc/spkg)
- *   {bin}/../zig/zig   (zig in sibling directory)
- * Returns static buffer or NULL. */
+/* Try to find zig relative to self-exe, following sharp's layout */
 static const char *find_zig_near_exe(void) {
     static char zig_path[PATH_MAX];
     char self_exe[PATH_MAX];
@@ -108,14 +107,12 @@ static const char *find_zig_near_exe(void) {
 
     char *slash = (char *)find_path_sep(self_exe);
     if (!slash) return NULL;
-    *slash = '\0';  /* self_dir */
+    *slash = '\0';
     size_t dirlen = strlen(self_exe);
 
 #ifdef _WIN32
-    #define EXE_EXT ".exe"
     const char *zig_name = "zig.exe";
 #else
-    #define EXE_EXT ""
     const char *zig_name = "zig";
 #endif
 
@@ -131,7 +128,7 @@ static const char *find_zig_near_exe(void) {
     char *parent_sep = (char *)find_path_sep(self_exe);
     if (parent_sep) {
         size_t pdirlen = (size_t)(parent_sep - self_exe);
-        size_t need = pdirlen + 1 + strlen(zig_name) + 4 + 1; /* +4 for /zig/ */
+        size_t need = pdirlen + 1 + strlen(zig_name) + 4 + 1;
         if (need < sizeof(zig_path)) {
             memcpy(zig_path, self_exe, pdirlen);
             zig_path[pdirlen] = PATH_SEP;
@@ -141,7 +138,6 @@ static const char *find_zig_near_exe(void) {
         }
     }
 
-#undef EXE_EXT
     return NULL;
 }
 
@@ -175,16 +171,14 @@ static int n_run_cmd(lua_State *L) {
     int status = pclose(fp);
 #ifdef _WIN32
     int code = status;
-    int ok = (code == 0);
 #else
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    int ok = (code == 0);
 #endif
 
     lua_newtable(L);
-    lua_pushboolean(L, ok);   lua_setfield(L, -2, "ok");
-    lua_pushstring(L, out);   lua_setfield(L, -2, "out");
-    lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+    lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
+    lua_pushstring(L, out);          lua_setfield(L, -2, "out");
+    lua_pushinteger(L, code);        lua_setfield(L, -2, "code");
 
     free(out);
     return 1;
@@ -224,13 +218,11 @@ static int win_mkdir_p(const char *path) {
     char tmp[PATH_MAX];
     strncpy(tmp, path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
-    /* Normalize slashes */
     for (char *p = tmp; *p; p++) {
         if (*p == '/') *p = '\\';
     }
-    /* Walk path segments and create each directory */
     char *p = tmp;
-    if (p[0] && p[1] == ':') p += 2;  /* skip drive letter */
+    if (p[0] && p[1] == ':') p += 2;
     if (*p == '\\' || *p == '/') p++;
     for (; *p; p++) {
         if (*p == '\\' || *p == '/') {
@@ -267,19 +259,14 @@ static int n_glob(lua_State *L) {
     const char *pattern = luaL_checkstring(L, 1);
 
 #ifdef _WIN32
-    /* Windows: use dir command via popen for ** patterns */
     char cmd[4096];
-    /* Convert Lua glob pattern to Windows dir pattern */
     char win_pattern[1024];
     strncpy(win_pattern, pattern, sizeof(win_pattern) - 1);
     win_pattern[sizeof(win_pattern) - 1] = '\0';
-    /* Replace / with \ */
     for (char *p = win_pattern; *p; p++) {
         if (*p == '/') *p = '\\';
     }
-    /* For ** patterns, use dir /s /b */
     if (strstr(win_pattern, "**")) {
-        /* Extract base directory and filename pattern */
         char base[1024] = ".";
         const char *name = "*";
         const char *dbl_star = strstr(win_pattern, "**");
@@ -293,10 +280,8 @@ static int n_glob(lua_State *L) {
         }
         const char *last_sep = find_path_sep(win_pattern);
         if (last_sep && last_sep > dbl_star) name = last_sep + 1;
-
         snprintf(cmd, sizeof(cmd), "dir /s /b \"%s\\%s\" 2>nul", base, name);
     } else {
-        /* Simple glob: use dir /b */
         snprintf(cmd, sizeof(cmd), "dir /b \"%s\" 2>nul", win_pattern);
     }
 
@@ -307,12 +292,10 @@ static int n_glob(lua_State *L) {
         int idx = 1;
         while (fgets(line, sizeof(line), fp)) {
             size_t ln = strlen(line);
-            if (ln > 0 && (line[ln - 1] == '\n' || line[ln - 1] == '\r')) {
-                line[ln - 1] = '\0';
-                if (ln > 1 && line[ln - 2] == '\r') line[ln - 2] = '\0';
+            while (ln > 0 && (line[ln-1] == '\n' || line[ln-1] == '\r')) {
+                line[--ln] = '\0';
             }
-            /* Skip empty lines */
-            if (line[0]) {
+            if (ln > 0) {
                 lua_pushstring(L, line);
                 lua_rawseti(L, -2, idx++);
             }
@@ -336,7 +319,6 @@ static int n_glob(lua_State *L) {
         }
         const char *last_slash = strrchr(pattern, '/');
         if (last_slash && last_slash > dbl_star) name = last_slash + 1;
-
         snprintf(cmd, sizeof(cmd),
                  "find '%s' -name '%s' -type f 2>/dev/null", base, name);
         FILE *fp = popen(cmd, "r");
@@ -399,13 +381,11 @@ static int n_write_file(lua_State *L) {
 
 /* ── spkg.find_sharpc ────────────────────────────────────────────── */
 static int n_find_sharpc(lua_State *L) {
-    /* 1. SHARPC env var */
     const char *env = getenv("SHARPC");
     if (env && is_executable(env)) {
         lua_pushstring(L, env); return 1;
     }
 
-    /* 2. Search relative to spkg binary */
     char self_exe[PATH_MAX];
     if (resolve_self_exe(self_exe, sizeof(self_exe))) {
         char *slash = (char *)find_path_sep(self_exe);
@@ -447,19 +427,16 @@ static int n_find_sharpc(lua_State *L) {
 
 /* ── spkg.find_zigcc ─────────────────────────────────────────────── */
 static int n_find_zigcc(lua_State *L) {
-    /* 1. ZIGCC env var */
     const char *env = getenv("ZIGCC");
     if (env && is_executable(env)) {
         lua_pushstring(L, env); return 1;
     }
 
-    /* 2. zig next to spkg binary (sharp's bundling layout) */
     const char *near = find_zig_near_exe();
     if (near) {
         lua_pushstring(L, near); return 1;
     }
 
-    /* 3. zig in PATH */
 #ifdef _WIN32
     FILE *fp = popen("where zig.exe 2>nul", "r");
 #else
@@ -469,8 +446,7 @@ static int n_find_zigcc(lua_State *L) {
         char path[PATH_MAX] = "";
         if (fgets(path, sizeof(path), fp)) {
             size_t n = strlen(path);
-            if (n > 0 && (path[n-1] == '\n' || path[n-1] == '\r')) path[n-1] = '\0';
-            if (n > 1 && path[n-2] == '\r') path[n-2] = '\0';
+            while (n > 0 && (path[n-1] == '\n' || path[n-1] == '\r')) path[--n] = '\0';
         }
         pclose(fp);
         if (path[0] && is_executable(path)) {
@@ -521,11 +497,9 @@ static int n_get_mtime(lua_State *L) {
         lua_pushnil(L);
         return 1;
     }
-    /* FILETIME is 100-nanosecond intervals since 1601-01-01 */
     ULARGE_INTEGER ft;
     ft.LowPart = fad.ftLastWriteTime.dwLowDateTime;
     ft.HighPart = fad.ftLastWriteTime.dwHighDateTime;
-    /* Convert to Unix timestamp (seconds since 1970-01-01) */
     double seconds = (double)(ft.QuadPart - 116444736000000000ULL) / 10000000.0;
     lua_pushnumber(L, seconds);
 #else
@@ -585,25 +559,28 @@ static int n_current_platform(lua_State *L) {
     return 1;
 }
 
-/* ── async command tracking (POSIX only) ─────────────────────────── */
-#ifndef _WIN32
-#include <sys/wait.h>
+/* ═══════════════════════════════════════════════════════════════════
+ * Async command execution — cross-platform (POSIX + Windows)
+ * ═══════════════════════════════════════════════════════════════════ */
 
 #define MAX_ASYNC_CMDS 64
+
+#ifdef _WIN32
+/* Windows: store process handle and temp file path */
 static struct {
-    int pid;
-    int in_use;
-    char out_file[256];
-} async_cmds[MAX_ASYNC_CMDS];
+    HANDLE hProcess;
+    int    in_use;
+    char   out_file[MAX_PATH];
+} win_async_cmds[MAX_ASYNC_CMDS];
 
 static int find_async_slot(void) {
     for (int i = 0; i < MAX_ASYNC_CMDS; i++) {
-        if (!async_cmds[i].in_use) return i;
+        if (!win_async_cmds[i].in_use) return i;
     }
     return -1;
 }
 
-/* ── spkg.start_cmd(cmd) → task_id (number) or nil ─────────────── */
+/* ── spkg.start_cmd(cmd) → task_id (number) or nil, err ────────── */
 static int n_start_cmd(lua_State *L) {
     const char *cmd = luaL_checkstring(L, 1);
     int slot = find_async_slot();
@@ -614,57 +591,60 @@ static int n_start_cmd(lua_State *L) {
     }
 
     /* Create temp file for output */
-    char tmpfile[] = "/tmp/spkg_cmd_XXXXXX";
-    int fd = mkstemp(tmpfile);
-    if (fd < 0) {
+    char tmpfile[MAX_PATH];
+    GetTempPathA(sizeof(tmpfile), tmpfile);
+    char tmpname[MAX_PATH];
+    GetTempFileNameA(tmpfile, "spk", 0, tmpname);
+
+    /* Build command: cmd.exe /c "command > tmpfile 2>&1" */
+    char full_cmd[8192];
+    snprintf(full_cmd, sizeof(full_cmd),
+             "cmd.exe /c \"%s > \\\"%s\\\" 2>&1\"", cmd, tmpname);
+
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessA(NULL, full_cmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        DeleteFileA(tmpname);
         lua_pushnil(L);
-        lua_pushliteral(L, "cannot create temp file");
+        lua_pushstring(L, "CreateProcess failed");
         return 2;
     }
-    close(fd);
 
-    /* Build command: cmd > tmpfile 2>&1 */
-    char full_cmd[4096];
-    snprintf(full_cmd, sizeof(full_cmd), "%s > '%s' 2>&1", cmd, tmpfile);
+    CloseHandle(pi.hThread);
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        remove(tmpfile);
-        lua_pushnil(L);
-        lua_pushliteral(L, "fork failed");
-        return 2;
-    }
-    if (pid == 0) {
-        /* Child */
-        execl("/bin/sh", "sh", "-c", full_cmd, (char *)NULL);
-        _exit(127);
-    }
-
-    /* Parent */
-    async_cmds[slot].pid = (int)pid;
-    async_cmds[slot].in_use = 1;
-    strncpy(async_cmds[slot].out_file, tmpfile, sizeof(async_cmds[slot].out_file) - 1);
+    win_async_cmds[slot].hProcess = pi.hProcess;
+    win_async_cmds[slot].in_use = 1;
+    strncpy(win_async_cmds[slot].out_file, tmpname, sizeof(win_async_cmds[slot].out_file) - 1);
 
     lua_pushinteger(L, slot + 1);  /* 1-based ID */
     return 1;
 }
 
-/* ── spkg.wait_task(task_id) → {ok, out, code} or nil ──────────── */
+/* ── spkg.wait_task(task_id) → {ok, out, code} | nil (running) ─── */
 static int n_wait_task(lua_State *L) {
-    int slot = (int)luaL_checkinteger(L, 1) - 1;  /* Convert to 0-based */
-    if (slot < 0 || slot >= MAX_ASYNC_CMDS || !async_cmds[slot].in_use) {
+    int slot = (int)luaL_checkinteger(L, 1) - 1;
+    if (slot < 0 || slot >= MAX_ASYNC_CMDS || !win_async_cmds[slot].in_use) {
         lua_pushnil(L);
         return 1;
     }
 
-    int status;
-    waitpid(async_cmds[slot].pid, &status, 0);
-    async_cmds[slot].in_use = 0;
+    /* Non-blocking check */
+    DWORD wait = WaitForSingleObject(win_async_cmds[slot].hProcess, 0);
+    if (wait == WAIT_TIMEOUT) {
+        lua_pushnil(L);  /* still running */
+        return 1;
+    }
 
-    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    DWORD exit_code = 0;
+    GetExitCodeProcess(win_async_cmds[slot].hProcess, &exit_code);
+    CloseHandle(win_async_cmds[slot].hProcess);
 
     /* Read output file */
-    FILE *fp = fopen(async_cmds[slot].out_file, "r");
+    FILE *fp = fopen(win_async_cmds[slot].out_file, "r");
     char *out = NULL;
     size_t total = 0;
     if (fp) {
@@ -684,7 +664,124 @@ static int n_wait_task(lua_State *L) {
     }
 
     /* Clean up temp file */
-    remove(async_cmds[slot].out_file);
+    DeleteFileA(win_async_cmds[slot].out_file);
+    win_async_cmds[slot].in_use = 0;
+
+    lua_newtable(L);
+    lua_pushboolean(L, exit_code == 0); lua_setfield(L, -2, "ok");
+    lua_pushstring(L, out ? out : "");  lua_setfield(L, -2, "out");
+    lua_pushinteger(L, (int)exit_code);  lua_setfield(L, -2, "code");
+
+    if (out) free(out);
+    return 1;
+}
+
+#else
+/* POSIX: fork/exec with temp file output */
+static struct {
+    pid_t pid;
+    int   in_use;
+    char  out_file[PATH_MAX];
+} posix_async_cmds[MAX_ASYNC_CMDS];
+
+static int find_async_slot(void) {
+    for (int i = 0; i < MAX_ASYNC_CMDS; i++) {
+        if (!posix_async_cmds[i].in_use) return i;
+    }
+    return -1;
+}
+
+/* ── spkg.start_cmd(cmd) → task_id (number) or nil, err ────────── */
+static int n_start_cmd(lua_State *L) {
+    const char *cmd = luaL_checkstring(L, 1);
+    int slot = find_async_slot();
+    if (slot < 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "too many async commands");
+        return 2;
+    }
+
+    /* Create temp file for output */
+    char tmpfile[] = "/tmp/spkg_cmd_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    if (fd < 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, strerror(errno));
+        return 2;
+    }
+    close(fd);
+
+    /* Build command: /bin/sh -c "cmd > tmpfile 2>&1" */
+    char full_cmd[4096];
+    snprintf(full_cmd, sizeof(full_cmd), "%s > '%s' 2>&1", cmd, tmpfile);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        remove(tmpfile);
+        lua_pushnil(L);
+        lua_pushstring(L, strerror(errno));
+        return 2;
+    }
+    if (pid == 0) {
+        /* Child */
+        execl("/bin/sh", "sh", "-c", full_cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    /* Parent */
+    posix_async_cmds[slot].pid = pid;
+    posix_async_cmds[slot].in_use = 1;
+    strncpy(posix_async_cmds[slot].out_file, tmpfile, sizeof(posix_async_cmds[slot].out_file) - 1);
+
+    lua_pushinteger(L, slot + 1);
+    return 1;
+}
+
+/* ── spkg.wait_task(task_id) → {ok, out, code} | nil (running) ─── */
+static int n_wait_task(lua_State *L) {
+    int slot = (int)luaL_checkinteger(L, 1) - 1;
+    if (slot < 0 || slot >= MAX_ASYNC_CMDS || !posix_async_cmds[slot].in_use) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    /* Non-blocking check with WNOHANG */
+    int status;
+    pid_t result = waitpid(posix_async_cmds[slot].pid, &status, WNOHANG);
+    if (result == 0) {
+        lua_pushnil(L);  /* still running */
+        return 1;
+    }
+    if (result < 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    /* Read output file */
+    FILE *fp = fopen(posix_async_cmds[slot].out_file, "r");
+    char *out = NULL;
+    size_t total = 0;
+    if (fp) {
+        char buf[4096];
+        out = malloc(1);
+        out[0] = '\0';
+        while (fgets(buf, sizeof(buf), fp)) {
+            size_t n = strlen(buf);
+            char *tmp = realloc(out, total + n + 1);
+            if (!tmp) { free(out); break; }
+            out = tmp;
+            memcpy(out + total, buf, n);
+            total += n;
+            out[total] = '\0';
+        }
+        fclose(fp);
+    }
+
+    /* Clean up temp file */
+    remove(posix_async_cmds[slot].out_file);
+    posix_async_cmds[slot].in_use = 0;
 
     lua_newtable(L);
     lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
@@ -692,17 +789,6 @@ static int n_wait_task(lua_State *L) {
     lua_pushinteger(L, code); lua_setfield(L, -2, "code");
 
     if (out) free(out);
-    return 1;
-}
-#else
-/* Windows stubs */
-static int n_start_cmd(lua_State *L) {
-    lua_pushnil(L);
-    lua_pushliteral(L, "async commands not supported on Windows");
-    return 2;
-}
-static int n_wait_task(lua_State *L) {
-    lua_pushnil(L);
     return 1;
 }
 #endif
