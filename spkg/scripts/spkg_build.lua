@@ -72,6 +72,7 @@ local function create_build_context()
     local artifacts = {}
     local install_list = {}
     local custom_steps = {}
+    local tests = {}
 
     function ctx:get_target()
         if _SPKG_TARGET and _SPKG_TARGET ~= "" then
@@ -203,6 +204,7 @@ local function create_build_context()
     ctx._install_list = install_list
     ctx._optimize_flags = optimize_flags
     ctx._custom_steps = custom_steps
+    ctx._tests = tests
 
     function ctx:add_custom_step(opts)
         local step = {
@@ -213,6 +215,15 @@ local function create_build_context()
         }
         table.insert(custom_steps, step)
         return step
+    end
+
+    function ctx:add_test(opts)
+        local name = opts and opts.name or "test"
+        local art = create_artifact(name, "exe")
+        art._is_test = true
+        table.insert(artifacts, art)
+        table.insert(tests, art)
+        return art
     end
 
     return ctx
@@ -288,7 +299,7 @@ end
 -- Build Graph Builder
 -- ═══════════════════════════════════════════════════════════════
 
-function M.build_graph_from_ctx(ctx)
+function M.build_graph_from_ctx(ctx, include_tests)
     local target = ctx:get_target()
 
     build_graph = {
@@ -299,17 +310,25 @@ function M.build_graph_from_ctx(ctx)
 
     local opt_flag = ctx._optimize_flags[ctx:get_optimize()] or "-O0"
 
+    -- Build combined list: install_list + tests (if requested)
+    local all_artifacts = {}
+    for _, a in ipairs(ctx._install_list) do table.insert(all_artifacts, a) end
+    if include_tests then
+        for _, t in ipairs(ctx._tests or {}) do table.insert(all_artifacts, t) end
+    end
+
     -- Topological sort to ensure correct build order
-    local sorted = topo_sort(ctx._install_list)
+    local sorted = topo_sort(all_artifacts)
 
     for _, art in ipairs(sorted) do
         local artifact_graph = {
-            name          = art.name,
-            type          = art.type,
-            target        = target,
-            compile_tasks = {},
-            link_step     = {},
-            run_args      = art.run_args or {},
+            name             = art.name,
+            type             = art.type,
+            target           = target,
+            compile_tasks    = {},
+            link_step        = {},
+            run_args         = art.run_args or {},
+            _is_test_artifact = art._is_test or false,
         }
 
         for _, src_spec in ipairs(art.sources) do
@@ -1025,5 +1044,81 @@ function M.run_first_artifact(extra_args)
 end
 
 M.create_build_context = create_build_context
+
+-- ═══════════════════════════════════════════════════════════════
+-- Test Runner (Phase 4)
+-- ═══════════════════════════════════════════════════════════════
+
+function M.execute_tests(verbose)
+    -- 0. Fetch dependencies
+    if not fetch_deps() then return false end
+
+    -- 1. Create build context
+    b = create_build_context()
+    local ok, err = pcall(dofile, "Sharp.lua")
+    if not ok then
+        print(error_msg("failed to execute Sharp.lua"))
+        print("  " .. tostring(err))
+        return false
+    end
+
+    if #b._tests == 0 then
+        print("spkg: no tests declared (use b:add_test() in Sharp.lua)")
+        return true
+    end
+
+    -- 2. Build graph
+    M.build_graph_from_ctx(b)
+
+    -- 3. Build test artifacts (topological order from build_graph)
+    for _, art in ipairs(build_graph.artifacts) do
+        if not art._is_test_artifact then goto continue end
+
+        print(COLOR("spkg: building test " .. art.name, "bold_cyan"))
+
+        -- Compile tasks
+        local pending_tasks = {}
+        for _, task in ipairs(art.compile_tasks) do
+            if needs_compile(task.source, task.output, task.cflags) then
+                spkg.mkdir_p("build/" .. art.name)
+                table.insert(pending_tasks, task)
+            else
+                if verbose then print("  [skip] " .. task.source .. " (up to date)") end
+            end
+        end
+
+        if #pending_tasks > 0 then
+            if not compile_tasks_parallel(pending_tasks, verbose, 1) then
+                return false
+            end
+        end
+
+        -- Link
+        if not link_artifact(art, verbose) then return false end
+
+        -- Run test
+        local exe = art.link_step.output
+        if not spkg.file_exists(exe) then
+            print(error_msg("test executable not found: " .. exe))
+            return false
+        end
+
+        local cmd = (is_windows() and '"' or "./") .. exe .. (is_windows() and '"' or "")
+        print(COLOR("  [test] " .. art.name, "bold_cyan"))
+
+        local r = spkg.run_cmd(cmd)
+        if r.out ~= "" then print(r.out) end
+        if not r.ok then
+            print(error_msg("test " .. art.name .. " failed (exit code " .. r.code .. ")"))
+            return false
+        end
+        print(COLOR("  [pass] " .. art.name, "bold_green"))
+
+        ::continue::
+    end
+
+    print(COLOR("spkg: all tests passed.", "bold_green"))
+    return true
+end
 
 return M

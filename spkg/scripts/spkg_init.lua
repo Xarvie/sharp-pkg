@@ -263,9 +263,7 @@ function spkg_cmd_clean()
 end
 
 function spkg_cmd_test()
-    -- Phase 4: test framework
-    print("spkg: test command not yet implemented (Phase 4).")
-    return true
+    return spkg_build.execute_tests(_SPKG_VERBOSE)
 end
 
 function spkg_cmd_cache(args)
