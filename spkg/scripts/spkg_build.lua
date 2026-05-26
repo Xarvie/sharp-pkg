@@ -395,7 +395,11 @@ local function link_artifact(artifact, verbose)
         end
 
         spkg.mkdir_p("build/" .. name)
-        local inputs = table.concat(link.inputs, " ")
+        local inputs_list = {}
+        for _, inp in ipairs(link.inputs) do
+            table.insert(inputs_list, '"' .. inp .. '"')
+        end
+        local inputs = table.concat(inputs_list, " ")
         local cmd = string.format('"%s" ar rcs "%s" %s', zig, link.output, inputs)
         if verbose then print("    " .. cmd) end
 

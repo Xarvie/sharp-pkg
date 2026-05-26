@@ -61,7 +61,7 @@ end
 -- Lua table serializer (for Sharp.lua init template)
 -- ═══════════════════════════════════════════════════════════════
 
-local function spkg_dump_lua(val, indent)
+function spkg_dump_lua(val, indent)
     indent = indent or 0
     local t = type(val)
     if t == "string" then return string.format("%q", val) end

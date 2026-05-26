@@ -38,6 +38,7 @@
 #endif
 
 #ifdef __APPLE__
+#include <mach-o/dyld.h>
 #include <TargetConditionals.h>
 #endif
 
@@ -66,11 +67,15 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
     buf[n] = '\0';
     return buf;
 #elif defined(__APPLE__)
-    #include <mach-o/dyld.h>
     uint32_t size = (uint32_t)bufsize;
     if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
-    char *real = realpath(buf, buf);
-    return real ? real : buf;
+    /* Resolve symlinks using a separate temp buffer */
+    char tmp[PATH_MAX];
+    char *real = realpath(buf, tmp);
+    if (real) {
+        memcpy(buf, real, strlen(real) + 1);
+    }
+    return buf;
 #elif defined(_WIN32)
     DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
     if (len == 0 || len >= bufsize) return NULL;
@@ -82,11 +87,11 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
 }
 
 /* Find path separator (handles both / and \) */
-static char *find_path_sep(const char *path) {
-    char *last = NULL;
+static const char *find_path_sep(const char *path) {
+    const char *last = NULL;
     const char *p = path;
     while (*p) {
-        if (*p == '/' || *p == '\\') last = (char *)p;
+        if (*p == '/' || *p == '\\') last = p;
         p++;
     }
     return last;
@@ -101,7 +106,7 @@ static const char *find_zig_near_exe(void) {
     char self_exe[PATH_MAX];
     if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
 
-    char *slash = find_path_sep(self_exe);
+    char *slash = (char *)find_path_sep(self_exe);
     if (!slash) return NULL;
     *slash = '\0';  /* self_dir */
     size_t dirlen = strlen(self_exe);
@@ -123,7 +128,7 @@ static const char *find_zig_near_exe(void) {
     }
 
     /* Priority 1b: {self_dir}/../zig/zig */
-    char *parent_sep = find_path_sep(self_exe);
+    char *parent_sep = (char *)find_path_sep(self_exe);
     if (parent_sep) {
         size_t pdirlen = (size_t)(parent_sep - self_exe);
         size_t need = pdirlen + 1 + strlen(zig_name) + 4 + 1; /* +4 for /zig/ */
@@ -214,12 +219,35 @@ static int n_dir_exists(lua_State *L) {
 }
 
 /* ── spkg.mkdir_p ────────────────────────────────────────────────── */
+#ifdef _WIN32
+static int win_mkdir_p(const char *path) {
+    char tmp[PATH_MAX];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    /* Normalize slashes */
+    for (char *p = tmp; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
+    /* Walk path segments and create each directory */
+    char *p = tmp;
+    if (p[0] && p[1] == ':') p += 2;  /* skip drive letter */
+    if (*p == '\\' || *p == '/') p++;
+    for (; *p; p++) {
+        if (*p == '\\' || *p == '/') {
+            char saved = *p;
+            *p = '\0';
+            CreateDirectoryA(tmp, NULL);
+            *p = saved;
+        }
+    }
+    return CreateDirectoryA(tmp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : -1;
+}
+#endif
+
 static int n_mkdir_p(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
 #ifdef _WIN32
-    char cmd[1280];
-    snprintf(cmd, sizeof(cmd), "mkdir \"%s\" 2>nul || cd .", path);
-    int r = system(cmd);
+    int r = win_mkdir_p(path);
     lua_pushboolean(L, r == 0);
 #else
     struct stat st;
@@ -380,7 +408,7 @@ static int n_find_sharpc(lua_State *L) {
     /* 2. Search relative to spkg binary */
     char self_exe[PATH_MAX];
     if (resolve_self_exe(self_exe, sizeof(self_exe))) {
-        char *slash = find_path_sep(self_exe);
+        char *slash = (char *)find_path_sep(self_exe);
         if (slash) *slash = '\0';
 
         char cand[PATH_MAX];
