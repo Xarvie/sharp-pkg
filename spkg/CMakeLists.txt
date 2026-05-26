@@ -73,6 +73,7 @@ endif()
 add_executable(spkg
     main.c
     native.c
+    mongoose.c
     ${EMBED_SOURCES}
 )
 

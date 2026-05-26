@@ -861,6 +861,133 @@ static int n_fingerprint(lua_State *L) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Phase 3: HTTP Client (using mongoose) — coordinator side
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Include mongoose for HTTP client support */
+#define MG_ENABLE_LINES  1
+#include "mongoose.h"
+
+/* Helper: synchronous HTTP request via mongoose event loop */
+struct http_ctx {
+    int         done;
+    int         status;
+    char       *body;
+    size_t      body_len;
+};
+
+static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
+    struct http_ctx *ctx = (struct http_ctx *) c->fn_data;
+    if (!ctx) return;
+
+    if (ev == MG_EV_HTTP_MSG) {
+        struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+        ctx->status = mg_http_status(hm);
+        ctx->body = (char *)malloc(hm->body.len + 1);
+        if (ctx->body) {
+            memcpy(ctx->body, hm->body.buf, hm->body.len);
+            ctx->body[hm->body.len] = '\0';
+            ctx->body_len = hm->body.len;
+        }
+        ctx->done = 1;
+    }
+    if (ev == MG_EV_CLOSE) {
+        if (!ctx->done) {
+            ctx->done = 1;  /* connection closed without response */
+        }
+    }
+}
+
+/* spkg.http_post(url, body) → {ok, body, code} */
+static int n_http_post(lua_State *L) {
+    const char *url = luaL_checkstring(L, 1);
+    const char *body = luaL_checkstring(L, 2);
+
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    struct http_ctx ctx = {0};
+    struct mg_connection *c = mg_http_connect(&mgr, url, http_ev_handler, &ctx);
+    if (!c) {
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "connect failed"); lua_setfield(L, -2, "body");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
+    mg_printf(c,
+              "POST %s HTTP/1.0\r\n"
+              "Host: %s\r\n"
+              "Content-Type: application/json\r\n"
+              "Content-Length: %zu\r\n"
+              "\r\n"
+              "%s",
+              mg_url_uri(url), mg_url_host(url), strlen(body), body);
+
+    /* Run event loop with timeout */
+    int timeout_ms = 60000;  /* 60 seconds */
+    while (!ctx.done) {
+        mg_mgr_poll(&mgr, 100);
+        timeout_ms -= 100;
+        if (timeout_ms <= 0) break;
+    }
+
+    lua_newtable(L);
+    int ok = (ctx.done && ctx.status >= 200 && ctx.status < 300);
+    lua_pushboolean(L, ok);  lua_setfield(L, -2, "ok");
+    lua_pushstring(L, ctx.body ? ctx.body : ""); lua_setfield(L, -2, "body");
+    lua_pushinteger(L, ctx.status ? ctx.status : 0); lua_setfield(L, -2, "code");
+
+    if (ctx.body) free(ctx.body);
+    mg_mgr_free(&mgr);
+    return 1;
+}
+
+/* spkg.http_get(url) → {ok, body, code} */
+static int n_http_get(lua_State *L) {
+    const char *url = luaL_checkstring(L, 1);
+
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    struct http_ctx ctx = {0};
+    struct mg_connection *c = mg_http_connect(&mgr, url, http_ev_handler, &ctx);
+    if (!c) {
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "connect failed"); lua_setfield(L, -2, "body");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        mg_mgr_free(&mgr);
+        return 1;
+    }
+
+    mg_printf(c,
+              "GET %s HTTP/1.0\r\n"
+              "Host: %s\r\n"
+              "\r\n",
+              mg_url_uri(url), mg_url_host(url));
+
+    int timeout_ms = 30000;  /* 30 seconds */
+    while (!ctx.done) {
+        mg_mgr_poll(&mgr, 100);
+        timeout_ms -= 100;
+        if (timeout_ms <= 0) break;
+    }
+
+    lua_newtable(L);
+    int ok = (ctx.done && ctx.status >= 200 && ctx.status < 300);
+    lua_pushboolean(L, ok);  lua_setfield(L, -2, "ok");
+    lua_pushstring(L, ctx.body ? ctx.body : ""); lua_setfield(L, -2, "body");
+    lua_pushinteger(L, ctx.status ? ctx.status : 0); lua_setfield(L, -2, "code");
+
+    if (ctx.body) free(ctx.body);
+    mg_mgr_free(&mgr);
+    return 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * Phase 2: Content-addressable Build Cache
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -1264,6 +1391,8 @@ static const luaL_Reg spkg_lib[] = {
     {"cache_clear",      n_cache_clear},
     {"custom_needs_run", n_custom_needs_run},
     {"custom_exec",      n_custom_exec},
+    {"http_post",        n_http_post},
+    {"http_get",         n_http_get},
     {NULL, NULL}
 };
 
