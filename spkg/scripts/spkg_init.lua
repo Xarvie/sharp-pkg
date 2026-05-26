@@ -23,11 +23,15 @@ spkg — Sharp Package Manager
   spkg build --verbose            detailed output
   spkg build --all                build all targets
   spkg build --jobs <N>           parallel compile jobs
+  spkg build --no-cache           disable build cache
   spkg run                        build + run executable
+  spkg test                       build + run tests
   spkg add <name>                 add a dependency to SharpDeps.lua
   spkg remove <name>              remove a dependency from SharpDeps.lua
   spkg list                       list dependencies
   spkg clean                      remove build/, spkg_packages/, Sharp.lock
+  spkg cache --stats              show cache statistics
+  spkg cache --clear              clear entire cache
   spkg help                       show this message
 ]])
         return true
@@ -56,6 +60,8 @@ spkg — Sharp Package Manager
         return spkg_cmd_clean()
     elseif cmd == "test" then
         return spkg_cmd_test()
+    elseif cmd == "cache" then
+        return spkg_cmd_cache(args)
     else
         print("spkg: unknown command '" .. cmd .. "'. Try 'spkg help'.")
         return false
@@ -221,7 +227,7 @@ function spkg_cmd_remove(args)
     -- Also remove from spkg_packages if present
     local pkg_dir = "spkg_packages/" .. name
     if spkg.dir_exists(pkg_dir) then
-        spkg.run_cmd("rm -rf '" .. pkg_dir .. "'")
+        spkg.remove(pkg_dir)
         print("spkg: removed package '" .. name .. "'")
     end
 
@@ -245,6 +251,45 @@ function spkg_cmd_test()
     -- Phase 4: test framework
     print("spkg: test command not yet implemented (Phase 4).")
     return true
+end
+
+function spkg_cmd_cache(args)
+    spkg.cache_init()
+    if #args == 0 then
+        print([[spkg cache — Build cache management
+
+  spkg cache --stats    show cache statistics
+  spkg cache --clear    clear entire cache
+]])
+        return true
+    end
+
+    if args[1] == "--stats" then
+        local stats = spkg.cache_stats()
+        print(string.format("Cache statistics:"))
+        print(string.format("  entries:  %d", stats.count or 0))
+        print(string.format("  hits:     %d", stats.hit or 0))
+        print(string.format("  misses:   %d", stats.miss or 0))
+        local size = stats.size or 0
+        if size > 1048576 then
+            print(string.format("  size:     %.1f MB", size / 1048576.0))
+        elseif size > 1024 then
+            print(string.format("  size:     %.1f KB", size / 1024.0))
+        else
+            print(string.format("  size:     %d bytes", size))
+        end
+        return true
+    elseif args[1] == "--clear" then
+        if spkg.cache_clear() then
+            print("spkg: cache cleared.")
+        else
+            print("spkg: failed to clear cache.")
+        end
+        return true
+    else
+        print("spkg: unknown cache option '" .. args[1] .. "'.")
+        return false
+    end
 end
 
 return true

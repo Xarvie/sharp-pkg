@@ -51,6 +51,7 @@ local function create_build_context()
     local ctx = {}
     local artifacts = {}
     local install_list = {}
+    local custom_steps = {}
 
     function ctx:get_target()
         if _SPKG_TARGET and _SPKG_TARGET ~= "" then
@@ -181,6 +182,18 @@ local function create_build_context()
     ctx._artifacts = artifacts
     ctx._install_list = install_list
     ctx._optimize_flags = optimize_flags
+    ctx._custom_steps = custom_steps
+
+    function ctx:add_custom_step(opts)
+        local step = {
+            name    = opts.name,
+            command = opts.command,
+            inputs  = opts.inputs or {},
+            outputs = opts.outputs or {},
+        }
+        table.insert(custom_steps, step)
+        return step
+    end
 
     return ctx
 end
@@ -644,6 +657,32 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Custom Step Integration
+-- ═══════════════════════════════════════════════════════════════
+
+local function execute_custom_steps(steps, verbose)
+    for _, step in ipairs(steps) do
+        local needs_run = spkg.custom_needs_run(step.inputs, step.outputs)
+        if not needs_run then
+            if verbose then print("  [skip] custom step " .. step.name .. " (up to date)") end
+        else
+            if verbose then
+                print("  [custom] " .. step.name .. ": " .. table.concat(step.command, " "))
+            else
+                print("  [custom] " .. step.name)
+            end
+            local r = spkg.custom_exec(step.command, nil)
+            if not r.ok then
+                print("    error:\n" .. r.out)
+                return false
+            end
+            if verbose and r.out ~= "" then print("    " .. r.out) end
+        end
+    end
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Dependency Fetching
 -- ═══════════════════════════════════════════════════════════════
 
@@ -705,6 +744,14 @@ function M._do_build(verbose, max_jobs)
 
     -- 2. Build the graph (DAG sorted)
     M.build_graph_from_ctx(b)
+
+    -- 2.5. Execute custom steps before artifact compilation
+    if #b._custom_steps > 0 then
+        if verbose then print("spkg: executing custom steps...") end
+        if not execute_custom_steps(b._custom_steps, verbose) then
+            return false
+        end
+    end
 
     -- 3. Execute each artifact in topological order
     local all_ok = true
