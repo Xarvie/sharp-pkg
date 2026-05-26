@@ -2,7 +2,13 @@
  * main.c — spkg CLI entry point.
  *
  * Embeds Lua 5.4, loads build scripts (embedded as C arrays at build time),
- * dispatches commands: init, build, run, add, update, clean, help.
+ * dispatches commands: init, build, run, add, clean, help.
+ *
+ * Supports:
+ *   spkg build --target <triple>    Cross-compile target
+ *   spkg build --optimize <level>   Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
+ *   spkg build --verbose            Detailed output
+ *   spkg build --all                Build all targets
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,9 +20,7 @@
 #include "lauxlib.h"
 #include "spkg.h"
 
-// ── native bindings (declared in spkg.h, defined in native.c) ──
-
-// ── embedded Lua scripts (generated at build time by embed_lua.cmake) ──
+/* ── embedded Lua scripts (generated at build time by embed_lua.cmake) ── */
 extern const unsigned char scripts_spkg_init_lua[];
 extern const unsigned int  scripts_spkg_init_lua_len;
 extern const unsigned char scripts_spkg_build_lua[];
@@ -53,7 +57,6 @@ static int load_embedded(lua_State *L, const char *name,
         return -1;
     }
 
-    /* Set the returned module table as a global, e.g. spkg_build */
     /* Strip trailing ".lua" from name */
     char global_name[256];
     strncpy(global_name, name, sizeof(global_name) - 1);
@@ -65,9 +68,48 @@ static int load_embedded(lua_State *L, const char *name,
     return 0;
 }
 
+/* ── parse CLI flags ─────────────────────────────────────────────── */
+typedef struct {
+    const char *cmd;
+    const char *target;       /* --target <triple>       */
+    const char *optimize;     /* --optimize <level>      */
+    int         verbose;      /* --verbose               */
+    int         all_targets;  /* --all                   */
+    const char *extra_args[64];
+    int         extra_count;
+} cli_args_t;
+
+static void parse_cli(int argc, char **argv, cli_args_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->optimize = "Debug";
+
+    int first_pos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            out->target = argv[++i];
+        } else if (strcmp(argv[i], "--optimize") == 0 && i + 1 < argc) {
+            out->optimize = argv[++i];
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            out->verbose = 1;
+        } else if (strcmp(argv[i], "--all") == 0) {
+            out->all_targets = 1;
+        } else if (argv[i][0] != '-') {
+            if (!first_pos) {
+                out->cmd = argv[i];
+                first_pos = 1;
+            } else {
+                out->extra_args[out->extra_count++] = argv[i];
+            }
+        }
+    }
+    if (!out->cmd) out->cmd = "build";
+}
+
 /* ── main ──────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    const char *cmd = (argc > 1) ? argv[1] : "build";
+    cli_args_t cli;
+    parse_cli(argc, argv, &cli);
+
     const char *home = getenv("HOME");
     if (!home) home = "/root";
 
@@ -96,16 +138,21 @@ int main(int argc, char **argv) {
         goto fail;
     }
 
-    lua_pushstring(L, cmd);
+    lua_pushstring(L, cli.cmd);
     lua_pushstring(L, home);
-    /* Push remaining args as a table */
+    lua_pushstring(L, cli.target   ? cli.target   : "");
+    lua_pushstring(L, cli.optimize ? cli.optimize : "Debug");
+    lua_pushboolean(L, cli.verbose);
+    lua_pushboolean(L, cli.all_targets);
+
+    /* Push extra args as a table */
     lua_newtable(L);
-    for (int i = 2; i < argc; i++) {
-        lua_pushstring(L, argv[i]);
-        lua_rawseti(L, -2, i - 1);
+    for (int i = 0; i < cli.extra_count; i++) {
+        lua_pushstring(L, cli.extra_args[i]);
+        lua_rawseti(L, -2, i + 1);
     }
 
-    int rc = lua_pcall(L, 3, 1, 0);
+    int rc = lua_pcall(L, 7, 1, 0);
     if (rc != LUA_OK) {
         fprintf(stderr, "spkg: %s\n", lua_tostring(L, -1));
         goto fail;

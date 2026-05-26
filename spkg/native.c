@@ -1,16 +1,19 @@
 /*
  * native.c — C native functions exposed to Lua via the "spkg" module.
  *
- * spkg.run_cmd(cmd)       → {ok, out, code}
- * spkg.file_exists(path)  → bool
- * spkg.dir_exists(path)   → bool
- * spkg.mkdir_p(path)      → bool
- * spkg.glob(pattern)      → {file1, file2, ...}
- * spkg.read_file(path)    → string or nil
- * spkg.write_file(path, s)→ bool
- * spkg.find_sharpc()      → string or nil
- * spkg.find_zigcc()       → string or nil
- * spkg.home_dir()         → string
+ * spkg.run_cmd(cmd)         → {ok, out, code}
+ * spkg.file_exists(path)    → bool
+ * spkg.dir_exists(path)     → bool
+ * spkg.mkdir_p(path)        → bool
+ * spkg.glob(pattern)        → {file1, file2, ...}
+ * spkg.read_file(path)      → string or nil
+ * spkg.write_file(path, s)  → bool
+ * spkg.find_sharpc()        → string or nil
+ * spkg.find_zigcc()         → string or nil
+ * spkg.home_dir()           → string
+ * spkg.cwd()                → string
+ * spkg.get_mtime(path)      → number or nil
+ * spkg.current_platform()   → string
  */
 
 #include <stdlib.h>
@@ -21,6 +24,11 @@
 #include <unistd.h>
 #include <glob.h>
 #include <errno.h>
+#include <time.h>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #include "lua.h"
 #include "lualib.h"
@@ -226,19 +234,79 @@ static int n_cwd(lua_State *L) {
     return 1;
 }
 
+/* ── spkg.get_mtime ────────────────────────────────────────────────── */
+static int n_get_mtime(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+#ifdef __APPLE__
+    lua_pushnumber(L, (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9);
+#else
+    lua_pushnumber(L, (double)st.st_mtim.tv_sec + (double)st.st_mtim.tv_nsec / 1e9);
+#endif
+    return 1;
+}
+
+/* ── spkg.current_platform ─────────────────────────────────────────── */
+static int n_current_platform(lua_State *L) {
+#if defined(__linux__) && defined(__ANDROID__)
+    #if defined(__aarch64__)
+        lua_pushstring(L, "aarch64-linux-android");
+    #else
+        lua_pushstring(L, "x86_64-linux-android");
+    #endif
+#elif defined(__linux__)
+    #if defined(__aarch64__)
+        lua_pushstring(L, "aarch64-pc-linux-gnu");
+    #elif defined(__arm__)
+        lua_pushstring(L, "armv7l-pc-linux-gnueabihf");
+    #else
+        lua_pushstring(L, "x86_64-pc-linux-gnu");
+    #endif
+#elif defined(__APPLE__)
+    #if TARGET_OS_IPHONE
+        #if defined(__aarch64__)
+            lua_pushstring(L, "arm64-apple-ios");
+        #else
+            lua_pushstring(L, "x86_64-apple-ios");
+        #endif
+    #else
+        #if defined(__aarch64__)
+            lua_pushstring(L, "arm64-apple-darwin");
+        #else
+            lua_pushstring(L, "x86_64-apple-darwin");
+        #endif
+    #endif
+#elif defined(_WIN32)
+    #if defined(_M_ARM64) || defined(__aarch64__)
+        lua_pushstring(L, "arm64-pc-windows-msvc");
+    #else
+        lua_pushstring(L, "x86_64-pc-windows-msvc");
+    #endif
+#else
+    lua_pushstring(L, "unknown");
+#endif
+    return 1;
+}
+
 /* ── register ──────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
-    {"run_cmd",       n_run_cmd},
-    {"file_exists",   n_file_exists},
-    {"dir_exists",    n_dir_exists},
-    {"mkdir_p",       n_mkdir_p},
-    {"glob",          n_glob},
-    {"read_file",     n_read_file},
-    {"write_file",    n_write_file},
-    {"find_sharpc",   n_find_sharpc},
-    {"find_zigcc",    n_find_zigcc},
-    {"home_dir",      n_home_dir},
-    {"cwd",           n_cwd},
+    {"run_cmd",         n_run_cmd},
+    {"file_exists",     n_file_exists},
+    {"dir_exists",      n_dir_exists},
+    {"mkdir_p",         n_mkdir_p},
+    {"glob",            n_glob},
+    {"read_file",       n_read_file},
+    {"write_file",      n_write_file},
+    {"find_sharpc",     n_find_sharpc},
+    {"find_zigcc",      n_find_zigcc},
+    {"home_dir",        n_home_dir},
+    {"cwd",             n_cwd},
+    {"get_mtime",       n_get_mtime},
+    {"current_platform", n_current_platform},
     {NULL, NULL}
 };
 
