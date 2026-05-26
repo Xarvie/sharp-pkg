@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
@@ -77,13 +78,26 @@ static int compile_task(const char *source_content, const char *cflags_str,
 #ifdef _WIN32
     char src_path[MAX_PATH];
     char tmp_dir[MAX_PATH];
-    GetTempPathA(sizeof(tmp_dir), tmp_dir);
-    snprintf(src_path, sizeof(src_path), "%sspkg_src_%d.sp", tmp_dir, rand());
-    snprintf(out_path, out_path_size, "%sspkg_out_%d.o", tmp_dir, rand());
+    DWORD tmp_len = GetTempPathA(sizeof(tmp_dir), tmp_dir);
+    if (tmp_len == 0 || tmp_len >= sizeof(tmp_dir)) return -1;
+    char tmp_name[MAX_PATH];
+    if (GetTempFileNameA(tmp_dir, "spk", 0, tmp_name) == 0) return -1;
+    snprintf(src_path, sizeof(src_path), "%s", tmp_name);
+    if (GetTempFileNameA(tmp_dir, "spk", 0, tmp_name) == 0) return -1;
+    snprintf(out_path, out_path_size, "%s", tmp_name);
 #else
-    char src_path[256];
-    snprintf(src_path, sizeof(src_path), "/tmp/spkg_src_%d.sp", rand());
-    snprintf(out_path, out_path_size, "/tmp/spkg_out_%d.o", rand());
+    char src_path[] = "/tmp/spkg_src_XXXXXX.sp";
+    char out_template[] = "/tmp/spkg_out_XXXXXX.o";
+
+    /* Create unique temp files using mkstemp */
+    int src_fd = mkstemp(src_path);
+    if (src_fd < 0) return -1;
+    close(src_fd);
+
+    int out_fd = mkstemp(out_template);
+    if (out_fd < 0) { remove(src_path); return -1; }
+    close(out_fd);
+    snprintf(out_path, out_path_size, "%s", out_template);
 #endif
 
     /* Write source to temp file */
@@ -219,6 +233,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         size_t b64_len = mg_base64_encode((unsigned char *)odata, (size_t)osize, b64, sizeof(b64));
         b64[b64_len] = '\0';
         free(odata);
+        odata = NULL; /* prevent use-after-free */
 
         /* Escape depfile for JSON */
         char dep_escaped[8192];
@@ -236,15 +251,26 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         dep_escaped[di] = '\0';
 
-        char resp[131072];
-        snprintf(resp, sizeof(resp),
-                 "{\"status\":\"ok\","
-                 "\"output\":\"%s\","
-                 "\"depfile\":\"%s\","
-                 "\"cached\":false}",
-                 b64, dep_escaped);
+        /* Build JSON response manually to avoid snprintf truncation warning */
+        const char *prefix = "{\"status\":\"ok\",\"output\":\"";
+        const char *mid = "\",\"depfile\":\"";
+        const char *suffix = "\",\"cached\":false}";
+        size_t resp_size = strlen(prefix) + b64_len + strlen(mid) + di + strlen(suffix) + 1;
+        char *resp = (char *)malloc(resp_size);
+        if (!resp) { remove(out_path); return; }
+        char *p = resp;
+        size_t n = strlen(prefix);
+        memcpy(p, prefix, n); p += n;
+        memcpy(p, b64, b64_len); p += b64_len;
+        n = strlen(mid);
+        memcpy(p, mid, n); p += n;
+        memcpy(p, dep_escaped, di); p += di;
+        n = strlen(suffix);
+        memcpy(p, suffix, n); p += n;
+        *p = '\0';
 
         send_json(c, 200, resp);
+        free(resp);
         remove(out_path);
         return;
     }

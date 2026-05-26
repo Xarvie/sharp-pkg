@@ -263,7 +263,7 @@ static int n_mkdir_p(lua_State *L) {
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
         lua_pushboolean(L, 1); return 1;
     }
-    char cmd[1280];
+    char cmd[PATH_MAX + 32];
     snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
     int r = system(cmd);
     lua_pushboolean(L, r == 0);
@@ -404,11 +404,12 @@ static int n_find_sharpc(lua_State *L) {
     }
 
     char self_exe[PATH_MAX];
+    char cand[PATH_MAX];
     if (resolve_self_exe(self_exe, sizeof(self_exe))) {
         char *slash = (char *)find_path_sep(self_exe);
         if (slash) *slash = '\0';
+        size_t dirlen = strlen(self_exe);
 
-        char cand[PATH_MAX];
 #ifdef _WIN32
         const char *rel[] = {
             "..\\..\\..\\build\\sharpc.exe",
@@ -427,10 +428,17 @@ static int n_find_sharpc(lua_State *L) {
         };
 #endif
         for (int i = 0; rel[i]; i++) {
+            size_t rlen = strlen(rel[i]);
+            size_t need = dirlen + 1 + rlen + 1;
+            if (need > PATH_MAX) continue;
+            memcpy(cand, self_exe, dirlen);
+            cand[dirlen] = '/';
+            memcpy(cand + dirlen + 1, rel[i], rlen + 1);
 #ifdef _WIN32
-            snprintf(cand, sizeof(cand), "%s\\%s", self_exe, rel[i]);
-#else
-            snprintf(cand, sizeof(cand), "%s/%s", self_exe, rel[i]);
+            /* Convert forward slashes to backslashes on Windows */
+            for (size_t j = dirlen; j < need - 1; j++) {
+                if (cand[j] == '/') cand[j] = '\\';
+            }
 #endif
             if (is_executable(cand)) {
                 lua_pushstring(L, cand); return 1;
@@ -609,9 +617,18 @@ static int n_start_cmd(lua_State *L) {
 
     /* Create temp file for output */
     char tmpfile[MAX_PATH];
-    GetTempPathA(sizeof(tmpfile), tmpfile);
+    DWORD tmplen = GetTempPathA(sizeof(tmpfile), tmpfile);
+    if (tmplen == 0 || tmplen >= sizeof(tmpfile)) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "GetTempPath failed");
+        return 2;
+    }
     char tmpname[MAX_PATH];
-    GetTempFileNameA(tmpfile, "spk", 0, tmpname);
+    if (GetTempFileNameA(tmpfile, "spk", 0, tmpname) == 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "GetTempFileName failed");
+        return 2;
+    }
 
     /* Build command: cmd.exe /c "command > tmpfile 2>&1" */
     char full_cmd[8192];
@@ -822,7 +839,7 @@ static int n_remove(lua_State *L) {
     int r;
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
         /* RemoveDirectoryA only works on empty dirs; use a simple recursive approach */
-        char cmd[4096];
+        char cmd[PATH_MAX + 64];
         snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", path);
         r = system(cmd);
     } else {
@@ -833,7 +850,7 @@ static int n_remove(lua_State *L) {
     int r = remove(path);
     if (r != 0) {
         /* Try as directory */
-        char cmd[1280];
+        char cmd[PATH_MAX + 32];
         snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
         r = system(cmd);
     }
@@ -902,6 +919,11 @@ static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 static char *build_http_post(const char *url, const char *body, size_t *out_len) {
     struct mg_str host = mg_url_host(url);
     const char *uri = mg_url_uri(url);
+    size_t body_len = strlen(body);
+
+    /* Clamp host length to safe value for snprintf */
+    size_t hlen_safe = host.len;
+    if (hlen_safe > 255) hlen_safe = 255;
 
     char header[512];
     int hlen = snprintf(header, sizeof(header),
@@ -910,13 +932,13 @@ static char *build_http_post(const char *url, const char *body, size_t *out_len)
               "Content-Type: application/json\r\n"
               "Content-Length: %zu\r\n"
               "\r\n",
-              uri, (int)host.len, host.buf, strlen(body));
+              uri, (int)hlen_safe, host.buf, body_len);
 
-    *out_len = hlen + strlen(body);
+    *out_len = hlen + body_len;
     char *req = (char *)malloc(*out_len + 1);
     if (!req) return NULL;
     memcpy(req, header, hlen);
-    memcpy(req + hlen, body, strlen(body));
+    memcpy(req + hlen, body, body_len);
     req[*out_len] = '\0';
     return req;
 }
@@ -971,12 +993,16 @@ static char *build_http_get(const char *url, size_t *out_len) {
     struct mg_str host = mg_url_host(url);
     const char *uri = mg_url_uri(url);
 
+    /* Clamp host length to safe value for snprintf */
+    size_t hlen_safe = host.len;
+    if (hlen_safe > 255) hlen_safe = 255;
+
     char header[512];
     int hlen = snprintf(header, sizeof(header),
               "GET %s HTTP/1.0\r\n"
               "Host: %.*s\r\n"
               "\r\n",
-              uri, (int)host.len, host.buf);
+              uri, (int)hlen_safe, host.buf);
 
     *out_len = hlen;
     char *req = (char *)malloc(*out_len + 1);
@@ -1048,7 +1074,6 @@ static const char *color_codes[] = {
     "\033[33;1m", /* 10: bold yellow */
     "\033[34;1m", /* 11: bold blue */
 };
-static const int color_code_count = sizeof(color_codes) / sizeof(color_codes[0]);
 
 /* spkg.colorize(text, color_name) → string with ANSI codes */
 static int n_colorize(lua_State *L) {
@@ -1153,9 +1178,29 @@ static void ensure_cache_dir(void) {
 #endif
 }
 
-/* Helper: build cache path for a key -> buf */
-static void cache_path_for(const char *key, char *buf, size_t bufsize) {
-    snprintf(buf, bufsize, "%s/%s", get_cache_dir(), key);
+/* Helper: build cache path for a key -> buf, returns buf or NULL on truncation */
+static char *cache_path_for(const char *key, char *buf, size_t bufsize) {
+    const char *dir = get_cache_dir();
+    size_t dlen = strlen(dir);
+    size_t klen = strlen(key);
+    if (dlen + 1 + klen + 1 > bufsize) return NULL;
+    memcpy(buf, dir, dlen);
+    buf[dlen] = '/';
+    memcpy(buf + dlen + 1, key, klen);
+    buf[dlen + 1 + klen] = '\0';
+    return buf;
+}
+
+/* Helper: append a filename to a cache dir path -> buf, returns buf or NULL */
+static char *cache_file_path(const char *cache_dir, const char *filename, char *buf, size_t bufsize) {
+    size_t dlen = strlen(cache_dir);
+    size_t flen = strlen(filename);
+    if (dlen + 1 + flen + 1 > bufsize) return NULL;
+    memcpy(buf, cache_dir, dlen);
+    buf[dlen] = '/';
+    memcpy(buf + dlen + 1, filename, flen);
+    buf[dlen + 1 + flen] = '\0';
+    return buf;
 }
 
 /* Helper: copy file from src to dst */
@@ -1197,14 +1242,15 @@ static int n_cache_get(lua_State *L) {
     const char *output_path = luaL_checkstring(L, 2);
 
     char cache_dir_path[PATH_MAX];
-    cache_path_for(key, cache_dir_path, sizeof(cache_dir_path));
-
     char cached_file[PATH_MAX];
-#ifdef _WIN32
-    snprintf(cached_file, sizeof(cached_file), "%s\\output.o", cache_dir_path);
-#else
-    snprintf(cached_file, sizeof(cached_file), "%s/output.o", cache_dir_path);
-#endif
+    if (!cache_path_for(key, cache_dir_path, sizeof(cache_dir_path))) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    if (!cache_file_path(cache_dir_path, "output.o", cached_file, sizeof(cached_file))) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
 
     if (!file_exists_native(cached_file)) {
         lua_pushboolean(L, 0);
@@ -1228,25 +1274,28 @@ static int n_cache_put(lua_State *L) {
     ensure_cache_dir();
 
     char cache_dir_path[PATH_MAX];
-    cache_path_for(key, cache_dir_path, sizeof(cache_dir_path));
+    char cached_file[PATH_MAX];
+    if (!cache_path_for(key, cache_dir_path, sizeof(cache_dir_path))) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    if (!cache_file_path(cache_dir_path, "output.o", cached_file, sizeof(cached_file))) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
 
     /* Create cache subdirectory */
 #ifdef _WIN32
     CreateDirectoryA(cache_dir_path, NULL);
 #else
-    char cmd[1280];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", cache_dir_path);
-    system(cmd);
+    {
+        char cmd[PATH_MAX + 32];
+        int n = snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", cache_dir_path);
+        if (n > 0 && (size_t)n < sizeof(cmd)) system(cmd);
+    }
 #endif
 
     /* Copy file_path → cache_dir/output.o */
-    char cached_file[PATH_MAX];
-#ifdef _WIN32
-    snprintf(cached_file, sizeof(cached_file), "%s\\output.o", cache_dir_path);
-#else
-    snprintf(cached_file, sizeof(cached_file), "%s/output.o", cache_dir_path);
-#endif
-
     lua_pushboolean(L, copy_file(file_path, cached_file) == 0);
     return 1;
 }
@@ -1260,25 +1309,19 @@ static int n_cache_stats(lua_State *L) {
 
     /* Read stats file if exists */
     char stats_file[PATH_MAX];
-#ifdef _WIN32
-    snprintf(stats_file, sizeof(stats_file), "%s\\.stats", dir);
-#else
-    snprintf(stats_file, sizeof(stats_file), "%s/.stats", dir);
-#endif
-
-    FILE *fp = fopen(stats_file, "r");
-    if (fp) {
-        fscanf(fp, "hit=%d miss=%d", &hit, &miss);
-        fclose(fp);
+    if (!cache_file_path(dir, ".stats", stats_file, sizeof(stats_file))) {
+        /* Stats file path too long; return empty stats */
+    } else {
+        FILE *fp = fopen(stats_file, "r");
+        if (fp) {
+            fscanf(fp, "hit=%d miss=%d", &hit, &miss);
+            fclose(fp);
+        }
     }
 
     /* Count cache entries and total size */
 #ifdef _WIN32
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "for /d %%D in (\"%s\\*\") do @set /a count+=1 & for %%F in (\"%%D\\output.o\") do @set /a size+=%%~zF",
-        dir);
-    /* Simpler approach: just count dirs */
+    char cmd[PATH_MAX + 128];
     snprintf(cmd, sizeof(cmd), "dir /b /ad \"%s\" 2>nul | find /c /v \"\"", dir);
     FILE *cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
@@ -1289,9 +1332,9 @@ static int n_cache_stats(lua_State *L) {
         pclose(cmd_fp);
     }
 #else
-    char cmd[1280];
+    char cmd[PATH_MAX + 64];
     snprintf(cmd, sizeof(cmd),
-        "ls -1d %s/*/ 2>/dev/null | wc -l", dir);
+        "ls -1d '%s'/*/ 2>/dev/null | wc -l", dir);
     FILE *cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
         char line[64];
@@ -1302,7 +1345,7 @@ static int n_cache_stats(lua_State *L) {
     }
     /* Total size */
     snprintf(cmd, sizeof(cmd),
-        "du -sb %s 2>/dev/null | cut -f1", dir);
+        "du -sb '%s' 2>/dev/null | cut -f1", dir);
     cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
         char line[64];
@@ -1326,11 +1369,11 @@ static int n_cache_clear(lua_State *L) {
     const char *dir = get_cache_dir();
 
 #ifdef _WIN32
-    char cmd[4096];
+    char cmd[PATH_MAX + 64];
     snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", dir);
     lua_pushboolean(L, system(cmd) == 0);
 #else
-    char cmd[1280];
+    char cmd[PATH_MAX + 32];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
     lua_pushboolean(L, system(cmd) == 0);
 #endif
@@ -1446,11 +1489,19 @@ static int n_custom_exec(lua_State *L) {
     /* Optionally set workdir (not supported cross-platform simply; use cd trick) */
     const char *workdir = lua_tostring(L, 2);
 
-    char full_cmd[4096];
+    char full_cmd[8192];
     if (workdir && workdir[0]) {
-        snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", workdir, cmd);
+        int n = snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", workdir, cmd);
+        if (n < 0 || (size_t)n >= sizeof(full_cmd)) {
+            lua_newtable(L);
+            lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+            lua_pushliteral(L, "command too long"); lua_setfield(L, -2, "out");
+            lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+            return 1;
+        }
     } else {
         strncpy(full_cmd, cmd, sizeof(full_cmd) - 1);
+        full_cmd[sizeof(full_cmd) - 1] = '\0';
     }
 
     FILE *fp = popen(full_cmd, "r");

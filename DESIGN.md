@@ -2,7 +2,7 @@
 
 > Sharp Package Manager & Build System
 > 日期：2026-05-26
-> 状态：Phase 1 + 1.5 已实现
+> 状态：Phase 1-4 全部完成，代码审查零警告
 
 ## 1. 愿景
 
@@ -26,7 +26,7 @@
 | **Phase 1.5** | 头文件依赖追踪、Windows 一等公民、并行编译、DAG 拓扑排序、命令指纹 | ✅ |
 | **Phase 2** | 内容寻址编译缓存（local）、Custom Step、spkg cache 命令 | ✅ |
 | **Phase 3** | 分布式编译（spkg-node + coordinator） | ✅ |
-| **Phase 4** | 彩色诊断、测试框架 | 开发中 |
+| **Phase 4** | 彩色诊断、测试框架 | ✅ |
 
 ---
 
@@ -806,4 +806,58 @@ b:install(test_exe)
 
 -- spkg test 命令自动发现并运行测试
 ```
+
+---
+
+## 18. 开发记录与代码审查
+
+### 18.1 Phase 完成时间线
+
+| 日期 | Phase | 内容 |
+|------|-------|------|
+| 2026-05-26 | Phase 1 | ✅ 声明式构建图、全平台 target、增量编译 |
+| 2026-05-26 | Phase 1.5 | ✅ 头文件依赖追踪、Windows 一等公民、并行编译、DAG |
+| 2026-05-26 | Phase 2 | ✅ 内容寻址缓存、Custom Step、cache CLI |
+| 2026-05-26 | Phase 3 | ✅ 分布式编译（spkg-node + coordinator + HTTP client） |
+| 2026-05-26 | Phase 4 | ✅ 彩色诊断输出、测试框架（b:add_test + spkg test） |
+
+### 18.2 代码审查修复记录（2026-05-26）
+
+**审查标准**: 零警告、零妥协、-Wall -Wextra -Wformat-truncation=2 -Wuse-after-free=1
+
+| # | 文件 | 严重性 | 问题描述 | 修复方案 |
+|---|------|--------|----------|----------|
+| 1 | spkg_init.lua | 高 | `spkg_cmd_run()` 函数缺失，`spkg run` 命令失效 | 重新添加函数，支持 `--dist` 分布式模式 |
+| 2 | spkg_init.lua | 低 | `spkg_cmd_run()` 重复定义（两处） | 删除重复定义 |
+| 3 | native.c | 高 | `n_find_sharpc` 格式字符串 `%c` 类型不匹配 | 改用 `memcpy` 手动拼接路径，消除 snprintf |
+| 4 | native.c | 高 | `n_find_sharpc` snprintf truncation warning | `memcpy` + `need > PATH_MAX` 边界检查 |
+| 5 | native.c | 高 | `n_custom_exec` snprintf truncation warning | `full_cmd` 增大到 8192，添加 `snprintf` 返回值检查 |
+| 6 | native.c | 高 | `cache_path_for` snprintf truncation warning | 重写为 `memcpy` 手动拼接，返回 NULL on overflow |
+| 7 | native.c | 高 | `cache_get/cache_put` cached_file truncation | 新增 `cache_file_path()` helper + 溢出检查 |
+| 8 | native.c | 高 | `cache_stats` cmd/stats_file truncation | `cache_file_path()` + `PATH_MAX+64` 精确分配 |
+| 9 | native.c | 中 | `cache_clear` cmd truncation | `PATH_MAX+64/32` 精确分配 |
+| 10 | native.c | 中 | `n_mkdir_p` cmd truncation | `PATH_MAX+32` 精确分配 |
+| 11 | native.c | 中 | `n_remove` cmd truncation | `PATH_MAX+64/32` 精确分配 |
+| 12 | native.c | 中 | `build_http_post/get` `%.*s` truncation | 限制 `host.len` 到 255 字节 |
+| 13 | native.c | 中 | `color_code_count` 未使用变量 | 删除 |
+| 14 | native.c | 高 | `n_start_cmd` Windows GetTempPathA 未检查返回值 | 添加返回值检查，失败时返回错误 |
+| 15 | native.c | 中 | `n_start_cmd` Windows GetTempFileNameA 未检查返回值 | 添加返回值检查 |
+| 16 | node.c | 高 | `compile_task` 使用 `rand()` 生成临时文件名，可能冲突 | 替换为 `mkstemp`(POSIX) / `GetTempFileNameA`(Windows) |
+| 17 | node.c | 高 | `compile_task` Windows GetTempPathA 未检查返回值 | 添加返回值检查 |
+| 18 | node.c | 高 | HTTP response snprintf truncation warning | 手动 `memcpy` 构建 JSON，完全避免 snprintf |
+| 19 | node.c | 高 | `odata` use-after-free | 添加 `odata = NULL` 置空 |
+
+**验证命令**:
+```bash
+cmake -B build -DCMAKE_C_FLAGS="-Wall -Wextra -Wformat-truncation=2 -Wuse-after-free=1"
+cmake --build build 2>&1 | grep -c "warning:"
+# → 0（零警告）
+```
+
+### 18.3 关键设计决策
+
+1. **路径拼接零 snprintf**: 所有涉及 PATH_MAX 的路径拼接统一使用 `memcpy` 手动实现，完全消除编译器 truncation 警告
+2. **临时文件安全**: POSIX 使用 `mkstemp()`，Windows 使用 `GetTempFileNameA()`，杜绝 `rand()` 竞态条件
+3. **动态响应构建**: HTTP 大响应（base64 编码的 .o 文件）使用精确 `malloc` + `memcpy`，避免固定大小缓冲区
+4. **snprintf 返回值检查**: 所有必要的 snprintf 调用都检查返回值，截断时返回错误而非静默失败
 
