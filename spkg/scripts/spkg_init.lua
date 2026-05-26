@@ -142,8 +142,7 @@ end
 function spkg_cmd_run()
     local ok = spkg_build.execute()
     if not ok then return false end
-    local result = spkg_build.run_first_artifact()
-    return result
+    return spkg_build.run_first_artifact()
 end
 
 function spkg_cmd_add(args)

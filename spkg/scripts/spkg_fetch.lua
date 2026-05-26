@@ -12,11 +12,16 @@ local function load_deps_file(path)
     if not spkg.file_exists(path) then
         return {}
     end
-    local ok, deps = pcall(dofile, path)
-    if not ok or type(deps) ~= "table" then
+    local ok, result = pcall(dofile, path)
+    if not ok then
+        print("spkg: error loading " .. path .. ": " .. tostring(result))
         return {}
     end
-    return deps
+    if type(result) ~= "table" then
+        print("spkg: " .. path .. " must return a table of dependencies")
+        return {}
+    end
+    return result
 end
 
 -- Resolve a single dependency to a URL
@@ -97,14 +102,15 @@ local function clone_dep(resolved, pkg_dir)
         return false
     end
 
-    -- Get commit hash
-    local saved = spkg.cwd()
-    spkg.run_cmd("cd '" .. pkg_dir .. "' && git rev-parse HEAD > /tmp/spkg_commit.txt")
-    spkg.run_cmd("cd '" .. saved .. "'")
-    local commit = spkg.read_file("/tmp/spkg_commit.txt")
-    if commit then commit = commit:gsub("%s+", "") end
-
-    resolved.commit = commit or "HEAD"
+    -- Get commit hash (avoid /tmp file race condition)
+    local cmd = "cd '" .. pkg_dir .. "' && git rev-parse HEAD"
+    local r = spkg.run_cmd(cmd)
+    local commit = r.ok and r.out:gsub("%s+", "") or nil
+    if commit and commit ~= "" then
+        resolved.commit = commit
+    else
+        resolved.commit = "HEAD"
+    end
     spkg_lock.save_one(resolved)
     return true
 end

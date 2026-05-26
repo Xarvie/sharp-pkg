@@ -405,6 +405,47 @@ end
 
 function M.execute()
     local verbose = (_SPKG_VERBOSE == true)
+    local all_targets = (_SPKG_ALL == true)
+
+    if all_targets then
+        return M.execute_all_targets(verbose)
+    end
+
+    return M.execute_single(verbose)
+end
+
+function M.execute_single(verbose)
+    return M._do_build(verbose)
+end
+
+function M.execute_all_targets(verbose)
+    -- Determine targets from Sharp.lua
+    -- For now, if Sharp.lua defines targets, parse them; otherwise just build default
+    local targets = M._discover_targets()
+    if #targets <= 1 then
+        -- Only one or zero targets, build normally
+        return M._do_build(verbose)
+    end
+
+    for _, target in ipairs(targets) do
+        print(string.format("spkg: building target [%d/%d]: %s", _SPKG_build_idx or 1, #targets, target))
+        _SPKG_TARGET = target
+        local ok = M._do_build(verbose)
+        if not ok then
+            print("spkg: failed to build target: " .. target)
+            return false
+        end
+    end
+    return true
+end
+
+function M._discover_targets()
+    -- Try to extract target list from Sharp.lua by looking for b:add_* calls
+    -- For Phase 1, just return the default target
+    return { spkg.current_platform() }
+end
+
+function M._do_build(verbose)
 
     -- 0. Fetch dependencies
     if not fetch_deps() then
