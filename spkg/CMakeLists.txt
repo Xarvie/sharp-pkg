@@ -92,3 +92,16 @@ endif()
 # ── install ───────────────────────────────────────────────────────────
 
 install(TARGETS spkg RUNTIME DESTINATION bin)
+
+# ── 5. spkg-node executable ─────────────────────────────────────────
+
+add_executable(spkg-node
+    node.c
+    mongoose.c
+)
+
+target_include_directories(spkg-node PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+install(TARGETS spkg-node RUNTIME DESTINATION bin)

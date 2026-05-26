@@ -640,7 +640,7 @@ Windows 默认 MAX_PATH = 264 字符限制，通过 `\\?\` 前缀支持长路径
 
 ---
 
-## 16. 分布式编译路线图（Phase 3）
+## 16. 分布式编译（Phase 3）
 
 ### 16.1 架构
 
@@ -665,61 +665,122 @@ Windows 默认 MAX_PATH = 264 字符限制，通过 `\\?\` 前缀支持长路径
 └──────────────────────────────────┘
 ```
 
-### 16.2 通信协议
+### 16.2 核心原则
 
-**任务请求：**
-```json
+- **coordinator 无状态**：本地 spkg 负责 DAG 解析、任务分发、结果收集
+- **node 无状态**：spkg-node 只接收编译任务，返回 .o，不保存状态
+- **本地优先**：本地有空闲 worker 时本地编译，否则分发到远程
+- **纯 C 实现**：spkg-node 是独立 C 程序，无外部依赖（仅用 BSD sockets）
+- **HTTP/1.0**：轻量协议，无 TLS（内网使用），无 JSON 依赖（手动解析）
+
+### 16.3 spkg-node CLI
+
+```bash
+spkg-node --listen 0.0.0.0:10080 --max-jobs 4 --sharpc /usr/bin/sharpc
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--listen <addr:port>` | 监听地址（默认 `0.0.0.0:10080`） |
+| `--max-jobs <N>` | 最大并发编译数（默认 4） |
+| `--sharpc <path>` | sharpc 路径（默认从 PATH 查找） |
+| `--cache-dir <path>` | 节点本地缓存目录 |
+
+### 16.4 通信协议
+
+**任务请求（POST /compile）：**
+
+```http
+POST /compile HTTP/1.0
+Content-Type: application/json
+Content-Length: 256
+
 {
-  "id": "task-001",
-  "type": "compile",
   "source": "src/main.sp",
+  "source_hash": "sha256:abc123...",
+  "cflags": ["-O2", "-Iinclude"],
   "target": "x86_64-pc-linux-gnu",
   "optimize": "ReleaseFast",
-  "cflags": ["-O2", "-Iinclude", "-Isrc"],
-  "needs_depfile": true,
-  "cache_key": "sha256:abc123..."
+  "cache_key": "fnv1a:1234567890abcdef"
 }
 ```
 
+> `source` 可以是文件路径（节点本地有源码）或 base64 编码的源码内容。
+> 分布式场景下 coordinator 先发送源码，后续同文件用 hash 引用。
+
 **任务响应：**
-```json
+
+```http
+HTTP/1.0 200 OK
+Content-Type: application/json
+
 {
-  "id": "task-001",
   "status": "ok",
-  "output": "<base64 encoded .o file>",
-  "depfile": "build/myapp/main.o: src/main.sp src/include/header.sp\n",
+  "output": "<base64 .o content>",
+  "depfile": "build/main.o: src/main.sp src/include/header.sp\n",
   "cached": false
 }
 ```
 
 **错误响应：**
-```json
+
+```http
+HTTP/1.0 500 Internal Server Error
+Content-Type: application/json
+
 {
-  "id": "task-001",
   "status": "error",
   "code": 1,
   "stderr": "error: cannot find module 'foo'"
 }
 ```
 
-### 16.3 增量编译在分布式场景下
+**健康检查（GET /health）：**
 
-1. 本地检查 `.sp` 和 `.d` 文件的 mtime + 命令指纹
-2. 如果需要编译，计算缓存键
-3. 检查本地/远程缓存
-4. 缓存未命中 → 发送任务到远程节点
-5. 远程节点返回 `.o` 和 `.d` 文件内容
-6. 本地写入 `.o` 和 `.d` 文件，更新缓存
-7. 下次增量检查时使用本地的 `.d` 文件
+```http
+GET /health HTTP/1.0
 
-### 16.4 spkg-node 设计
+HTTP/1.0 200 OK
+Content-Type: application/json
+{"status": "ok", "jobs": 2, "max_jobs": 4}
+```
 
-- 轻量级 HTTP 服务器
-- 端点：`POST /compile` 接收任务
-- 执行 `sharpc` 编译
-- 返回 `.o` 文件内容
-- 可配置：最大并发数、支持的 target 列表
-- 本地缓存：`$HOME/.spkg-node-cache`
+### 16.5 native.c 新增 API（coordinator 侧）
+
+| 函数 | 返回 | 说明 |
+|------|------|------|
+| `spkg.http_post(url, body)` | `{ok, body, code}` | HTTP POST 请求 |
+| `spkg.http_get(url)` | `{ok, body, code}` | HTTP GET 请求 |
+
+### 16.6 spkg_build.lua 集成
+
+```lua
+-- 分布式编译入口
+function M.execute_distributed(nodes, verbose, max_jobs)
+    -- 1. 构建 DAG（与本地相同）
+    -- 2. 对每个编译任务：
+    --    a. 检查本地缓存
+    --    b. 缓存未命中 → 选择空闲节点
+    --    c. 发送源码 + cflags → 远程编译
+    --    d. 接收 .o → 写入本地
+    -- 3. 本地链接
+end
+```
+
+### 16.7 节点注册与发现
+
+| 方式 | 说明 |
+|------|------|
+| 手动配置 | `spkg_nodes.json` 文件列出节点地址 |
+| 环境变量 | `SPKG_NODES=node1:10080,node2:10080` |
+| mDNS 发现 | 可选，Phase 3+ |
+
+### 16.8 安全考虑
+
+- **内网使用**：无 TLS，假设运行在可信网络
+- **命令隔离**：节点不执行任意命令，只执行 `sharpc` 编译
+- **资源限制**：`--max-jobs` 限制并发，防止节点过载
+- **超时**：HTTP 请求默认 60s 超时
 
 ---
 
