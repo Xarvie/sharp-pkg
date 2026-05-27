@@ -912,4 +912,57 @@ cmake --build build 2>&1 | grep -c "warning:"
 | 1 | spkg_fetch.lua | `spkg update` 命令 | 检查远程仓库最新 commit，与 Sharp.lock 对比，如有更新则重新拉取并更新 lock 文件 |
 | 2 | spkg_init.lua | 注册 `spkg update` 命令 | 添加到 help 和命令分发 |
 | 3 | spkg_build.lua | 修复 `gsub` Lua 模式问题 | `%.d` → `.d`（2 处），避免 "invalid use of '%' in replacement string" |
+| 4 | spkg_build.lua | 分布式编译 `|` 分隔符被 shell 解释为 pipe | node.c 中将 `|` 转为空格再传给 popen |
+| 5 | spkg_build.lua | `Lua continue` 语法错误 | Lua 5.1 不支持 continue，改为嵌套 if/else |
+| 6 | spkg_build.lua | 远程节点失败时无重试 | 添加 retry 逻辑：遍历 nodes 进行 round-robin 重试 |
+
+### 18.7 分布式编译上下文打包（2026-05-27）
+
+**问题**：分布式编译时，远程节点没有源码引用的头文件（`#include`），导致编译失败。
+`-E`（预处理）+ `-MMD`（depfile）不能同时使用（gcc/clang/sharpc 均不支持）。
+
+**方案 2：上下文打包** — 将 `#include` 依赖的头文件内容打包到编译请求中发送。
+
+**Lua 侧（spkg_build.lua）新增 4 个函数**：
+
+| 函数 | 功能 |
+|------|------|
+| `parse_includes(source)` | 解析源码中 `#include "..."` / `#include <...>` 指令 |
+| `resolve_include_path(inc, dirs, srcdir)` | 在 include 目录列表中查找头文件完整路径 |
+| `extract_include_dirs(cflags)` | 从 cflags 列表中提取 `-I` 目录 |
+| `collect_headers(source, dirs, srcdir)` | 递归收集所有依赖头文件（深度限制 10） |
+
+**编译请求 JSON 新增 `headers` 字段**：
+
+```json
+{
+  "source": "#include \"lib/calc.h\"\nint main() { return add(1, 2); }",
+  "cflags": ["-O2"],
+  "optimize": "Debug",
+  "headers": [
+    {"path": "lib/calc.h", "content": "#ifndef CALC_H\n#define CALC_H\nint add(int a, int b);\n#endif"}
+  ]
+}
+```
+
+**node.c 侧修改**：
+
+| 修改 | 说明 |
+|------|------|
+| `parse_headers()` | 解析 JSON `headers` 数组，写入临时目录 `/tmp/spkg_hdr_XXXXXX` |
+| `make_dirs()` | 递归创建目录，确保 `lib/calc.h` 路径正确 |
+| `remove_dir()` | 编译后递归删除临时头文件目录 |
+| `ev_handler` 重构 | 使用 `goto cleanup` 模式，在所有退出路径清理 `hdr_dir` |
+| cflags 追加 `-I<tempdir>` | 将临时头文件目录添加到编译命令的 include path |
+
+**修复 3 个编译警告**：`const` 限定符丢失 → 显式转换；`depfile[512]` → `[1024]`；`cmd[4096]` → `[8192]`。
+
+**端到端测试验证**：
+
+| 测试场景 | 结果 |
+|----------|------|
+| 不带 `-I` 带 headers | OK — 节点从 headers 写入临时目录并添加 `-I` |
+| 不带 `-I` 不带 headers | FAIL — `file not found: lib/calc.h` |
+| Temp 文件清理 | headers/source/output 全部清理干净 |
+| Depfile 生成 | `/tmp/spkg_hdr_XXXXXX/lib/calc.h` 正确出现在 depfile 中 |
 

@@ -16,6 +16,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <dirent.h>
 
 #ifdef _WIN32
 #define PATH_SEP '\\'
@@ -107,7 +110,6 @@ static const char *find_sharpc_path(char *buf, size_t sz) {
         memcpy(buf, self_exe, dirlen);
         buf[dirlen] = PATH_SEP;
         memcpy(buf + dirlen + 1, rel[i], rlen + 1);
-        fprintf(stderr, "[DEBUG] trying sharpc: %s\n", buf);
         if (is_executable(buf)) return buf;
     }
     return NULL;
@@ -120,6 +122,13 @@ static const char *g_sharpc     = "sharpc";
 static int         g_max_jobs   = 4;
 static volatile int g_running   = 1;
 static volatile int g_active    = 0;
+static volatile int g_compile_timed_out = 0;
+#define COMPILE_TIMEOUT_SEC 120
+
+static void timeout_handler(int sig) {
+    (void)sig;
+    g_compile_timed_out = 1;
+}
 
 /* ── Minimal JSON extraction helpers ────────────────────────────── */
 
@@ -165,6 +174,89 @@ static int json_get_cflags(struct mg_str json, char *buf, size_t bufsize) {
     if (off > 0 && buf[off - 1] == '|') buf[--off] = '\0';
     else buf[off] = '\0';
     return 1;
+}
+
+/* ── Header context packaging ──────────────────────────────────── */
+
+/* Recursively create directories for a file path */
+static int make_dirs(const char *path) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    return 1;
+}
+
+/* Recursively remove a directory tree */
+static void remove_dir(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return;
+    struct dirent *entry;
+    char sub[PATH_MAX];
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        snprintf(sub, sizeof(sub), "%s/%s", path, entry->d_name);
+        /* Use stat() instead of d_type for portability (XFS without ftype) */
+        struct stat st;
+        if (entry->d_type == DT_DIR || (entry->d_type == DT_UNKNOWN && stat(sub, &st) == 0 && S_ISDIR(st.st_mode))) {
+            remove_dir(sub);
+        } else {
+            remove(sub);
+        }
+    }
+    closedir(d);
+    rmdir(path);
+}
+
+/* Parse headers JSON array, write to temp dir, return dir path (caller must free + remove_dir) */
+static char *parse_headers(struct mg_str json) {
+    int tok = mg_json_get(json, "$.headers", (int *)NULL);
+    if (tok < 0) return NULL;  /* No headers field */
+    const char *p = json.buf + tok;
+    if (*p != '[') return NULL;
+
+    /* Create temp directory */
+    char hdr_dir[] = "/tmp/spkg_hdr_XXXXXX";
+    if (!mkdtemp(hdr_dir)) return NULL;
+    char *hdr_copy = strdup(hdr_dir);
+    if (!hdr_copy) { rmdir(hdr_dir); return NULL; }
+
+    /* Parse array entries: {"path":"...","content":"..."} */
+    p++;  /* skip '[' */
+    const char *end = json.buf + json.len;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')) p++;
+        if (p >= end || *p == ']') break;
+        if (*p != '{') { p++; continue; }
+
+        int depth = 1;
+        const char *obj_start = p;
+        p++;
+        while (p < end && depth > 0) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            p++;
+        }
+        struct mg_str obj = {(char *)obj_start, (size_t)(p - obj_start)};
+
+        char *hpath = mg_json_get_str(obj, "$.path");
+        char *hcontent = mg_json_get_str(obj, "$.content");
+        if (hpath && hcontent) {
+            char full_path[PATH_MAX];
+            snprintf(full_path, sizeof(full_path), "%s/%s", hdr_dir, hpath);
+            make_dirs(full_path);
+            FILE *fp = fopen(full_path, "w");
+            if (fp) { fputs(hcontent, fp); fclose(fp); }
+        }
+        free(hpath);
+        free(hcontent);
+    }
+    return hdr_copy;
 }
 
 /* ── Compile task execution ─────────────────────────────────────── */
@@ -213,8 +305,8 @@ static int compile_task(const char *source_content, const char *cflags_str,
     fclose(fp);
 
     /* Build command: -c for object file (gcc compatible) */
-    char cmd[4096];
-    char depfile[512];
+    char cmd[8192];
+    char depfile[1024];
     snprintf(depfile, sizeof(depfile), "%s.d", out_path);
 
     const char *opt_flag = "-O0";
@@ -240,7 +332,9 @@ static int compile_task(const char *source_content, const char *cflags_str,
              g_sharpc, opt_flag, cflags_safe,
              depfile, src_path, out_path);
 
-    /* Capture output */
+    /* Capture output with timeout */
+    signal(SIGALRM, timeout_handler);
+    alarm(COMPILE_TIMEOUT_SEC);
     FILE *pfp = popen(cmd, "r");
     int ret = -1;
     if (pfp) {
@@ -253,13 +347,28 @@ static int compile_task(const char *source_content, const char *cflags_str,
             }
         }
         int status = pclose(pfp);
+        alarm(0);
+        signal(SIGALRM, SIG_DFL);
+        if (g_compile_timed_out) {
+            g_compile_timed_out = 0;
+            if (error_out && error_buf_size > 0) {
+                snprintf(error_out, error_buf_size, "compilation timed out after %d seconds", COMPILE_TIMEOUT_SEC);
+            }
+        }
 #ifdef _WIN32
         ret = (status == 0) ? 0 : -1;
 #else
         ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 #endif
     } else {
-        if (error_out && error_buf_size > 0) {
+        alarm(0);
+        signal(SIGALRM, SIG_DFL);
+        if (g_compile_timed_out) {
+            g_compile_timed_out = 0;
+            if (error_out && error_buf_size > 0) {
+                snprintf(error_out, error_buf_size, "compilation timed out after %d seconds", COMPILE_TIMEOUT_SEC);
+            }
+        } else if (error_out && error_buf_size > 0) {
             snprintf(error_out, error_buf_size, "popen failed: %s", strerror(errno));
         }
     }
@@ -309,6 +418,12 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
     /* Route: POST /compile */
     if (uri_eq(hm->uri, "/compile")) {
+        if (hm->body.len > 10 * 1024 * 1024) {
+            send_json(c, 413,
+                      "{\"status\":\"error\",\"code\":413,"
+                      "\"stderr\":\"request body too large (max 10 MB)\"}");
+            return;
+        }
         if (g_active >= g_max_jobs) {
             send_json(c, 503,
                       "{\"status\":\"error\",\"code\":503,"
@@ -334,6 +449,20 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         char optimize[64] = {0};
         json_get_cflags(hm->body, cflags, sizeof(cflags));
         json_get_str(hm->body, "optimize", optimize, sizeof(optimize));
+
+        /* Parse headers and create temp header dir */
+        char *hdr_dir = parse_headers(hm->body);
+        if (hdr_dir) {
+            size_t len = strlen(cflags);
+            size_t need = strlen(hdr_dir) + 4;  /* -I + path */
+            if (len + need < sizeof(cflags)) {
+                if (len > 0) { cflags[len] = '|'; len++; }
+                cflags[len++] = '-'; cflags[len++] = 'I';
+                memcpy(cflags + len, hdr_dir, need - 3);
+                len += need - 3;
+                cflags[len] = '\0';
+            }
+        }
 
         /* Execute compilation */
         g_active++;
@@ -368,7 +497,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             const char *suffix = "\"}";
             size_t resp_size = strlen(prefix) + ei + strlen(suffix) + 1;
             char *err_resp = (char *)malloc(resp_size);
-            if (!err_resp) { free(src_ptr); return; }
+            if (!err_resp) { goto cleanup; }
             char *p = err_resp;
             size_t n = strlen(prefix);
             memcpy(p, prefix, n); p += n;
@@ -378,11 +507,8 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
             send_json(c, 500, err_resp);
             free(err_resp);
-            free(src_ptr);
-            return;
+            goto cleanup;
         }
-
-        free(src_ptr);
 
         /* Read .o file */
         FILE *fp = fopen(out_path, "rb");
@@ -391,7 +517,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
                       "{\"status\":\"error\",\"code\":2,"
                       "\"stderr\":\"cannot read output .o\"}");
             remove(out_path);
-            return;
+            goto cleanup;
         }
         fseek(fp, 0, SEEK_END);
         long osize = ftell(fp);
@@ -403,7 +529,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":3,"
                       "\"stderr\":\"out of memory\"}");
-            return;
+            goto cleanup;
         }
         size_t nread = fread(odata, 1, osize, fp);
         fclose(fp);
@@ -412,7 +538,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":4,"
                       "\"stderr\":\"read .o file failed\"}");
-            return;
+            goto cleanup;
         }
 
         /* Base64 encode */
@@ -426,7 +552,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":5,"
                       "\"stderr\":\"out of memory\"}");
-            return;
+            goto cleanup;
         }
         b64_len = mg_base64_encode((unsigned char *)odata, (size_t)osize, b64, b64_size);
         free(odata);
@@ -435,7 +561,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":6,"
                       "\"stderr\":\"base64 encode failed\"}");
-            return;
+            goto cleanup;
         }
 
         /* Escape depfile for JSON */
@@ -465,7 +591,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":7,"
                       "\"stderr\":\"out of memory\"}");
-            return;
+            goto cleanup;
         }
         char *p = resp;
         size_t n = strlen(prefix);
@@ -482,6 +608,14 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         free(b64);
         free(resp);
         remove(out_path);
+        /* fall through */
+
+cleanup:
+        if (hdr_dir) {
+            remove_dir(hdr_dir);
+            free(hdr_dir);
+        }
+        free(src_ptr);
         return;
     }
 

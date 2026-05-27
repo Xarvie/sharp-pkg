@@ -750,6 +750,75 @@ local function b64_decode(str)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Header Dependency Collection for Distributed Build
+-- ═══════════════════════════════════════════════════════════════
+
+-- Parse #include directives from source code
+-- Returns list of include paths (e.g., "stdio.h", "lib/mylib.h")
+local function parse_includes(source)
+    local includes = {}
+    for line in source:gmatch("[^\n]*") do
+        -- Match #include "..." or #include <...>
+        local inc = line:match('#%s*include%s+"([^"]+)"')
+                    or line:match('#%s*include%s+<([^>]+)>')
+        if inc then table.insert(includes, inc) end
+    end
+    return includes
+end
+
+-- Resolve an include path against a list of include directories
+-- Returns the full path if found, nil otherwise
+local function resolve_include_path(inc_path, include_dirs, source_dir)
+    -- Try include directories from task cflags (-I flags)
+    for _, dir in ipairs(include_dirs) do
+        local full = dir .. "/" .. inc_path
+        if spkg.file_exists(full) then return full end
+    end
+    -- Try relative to source file directory
+    if source_dir and source_dir ~= "" then
+        local full = source_dir .. "/" .. inc_path
+        if spkg.file_exists(full) then return full end
+    end
+    return nil
+end
+
+-- Extract -I directories from cflags list
+local function extract_include_dirs(cflags)
+    local dirs = {}
+    for _, flag in ipairs(cflags) do
+        if flag:sub(1, 2) == "-I" then
+            local dir = flag:sub(3)
+            if dir ~= "" then table.insert(dirs, dir) end
+        end
+    end
+    return dirs
+end
+
+-- Collect all header dependencies recursively
+-- Returns a map: relative_path -> file_content
+local function collect_headers(source, include_dirs, source_dir, visited, depth)
+    visited = visited or {}
+    depth = depth or 0
+    if depth > 10 then return visited end  -- Prevent infinite recursion
+
+    local includes = parse_includes(source)
+    for _, inc in ipairs(includes) do
+        if not visited[inc] then
+            local full_path = resolve_include_path(inc, include_dirs, source_dir)
+            if full_path then
+                local content = spkg.read_file(full_path)
+                if content then
+                    visited[inc] = content
+                    -- Recursively collect headers from this header
+                    collect_headers(content, include_dirs, source_dir, visited, depth + 1)
+                end
+            end
+        end
+    end
+    return visited
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Dependency Fetching
 -- ═══════════════════════════════════════════════════════════════
 
@@ -823,27 +892,44 @@ function M.execute_distributed(verbose, max_jobs)
                     return false
                 end
 
+                -- Collect header dependencies for distributed build
+                local include_dirs = extract_include_dirs(task.cflags)
+                local source_dir = task.source:match("(.*/)") or "."
+                local headers = collect_headers(source, include_dirs, source_dir)
+
                 -- Try each node (round-robin starting from current idx)
                 local task_ok = false
                 local last_err = ""
                 for attempt = 1, #nodes do
-                    local try_idx = ((node_idx + attempt - 1 - 1) % #nodes) + 1
+                    local try_idx = ((node_idx + attempt - 1) % #nodes) + 1
                     local node = nodes[try_idx]
 
-                    -- Build JSON request (escape source content properly)
+                    -- Build JSON request with headers
                     local cflags_json = "["
                     for i, f in ipairs(task.cflags) do
                         if i > 1 then cflags_json = cflags_json .. "," end
-                        cflags_json = cflags_json .. '"' .. f .. '"'
+                        local f_escaped = f:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+                        cflags_json = cflags_json .. '"' .. f_escaped .. '"'
                     end
                     cflags_json = cflags_json .. "]"
 
-                    local opt = _SPKG_OPTIMIZE or "Debug"
                     -- Escape source: backslash first, then quotes and control chars
                     local escaped = source:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+
+                    -- Build headers JSON: {"path":"path1","content":"..."},{"path":"path2","content":"..."}
+                    local headers_json = ""
+                    local first = true
+                    for hpath, hcontent in pairs(headers) do
+                        if not first then headers_json = headers_json .. "," end
+                        first = false
+                        local h_escaped = hcontent:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+                        headers_json = headers_json .. string.format('{"path":"%s","content":"%s"}', hpath, h_escaped)
+                    end
+
+                    local opt = _SPKG_OPTIMIZE or "Debug"
                     local req = string.format(
-                        '{"source":"%s","cflags":%s,"optimize":"%s"}',
-                        escaped, cflags_json, opt)
+                        '{"source":"%s","cflags":%s,"optimize":"%s","headers":[%s]}',
+                        escaped, cflags_json, opt, headers_json)
 
                     -- Send to node
                     if verbose and attempt == 1 then
@@ -867,38 +953,43 @@ function M.execute_distributed(verbose, max_jobs)
                             return false
                         end
                     else
-                        -- Parse response
-                        local output = r.body:match('"output":"([^"]*)"')
-                        if output then
-                            local decoded = b64_decode(output)
-                            spkg.write_file(task.output, decoded)
-                            save_fingerprint(task.output, task.cflags)
-
-                            -- Write depfile if present
-                            local depfile = r.body:match('"depfile":"([^"]*)"')
-                            if depfile and depfile ~= "" then
-                                -- Unescape JSON string
-                                depfile = depfile:gsub("\\n", "\n"):gsub("\\\\", "\\")
-                                local dep_path = task.output:gsub("%.o$", "%.d")
-                                spkg.write_file(dep_path, depfile)
-                            end
-
-                            task_ok = true
-                            node_idx = try_idx
-                            break
-                        else
-                            -- Check for error response
-                            local err = r.body:match('"stderr":"([^"]*)"')
-                            if err then
-                                last_err = err
-                            else
-                                last_err = "no output from node"
-                            end
-                            if attempt < #nodes then
-                                -- Try next node
-                            else
+                        -- Parse response with proper JSON parser
+                        local ok_json, resp = pcall(spkg.json_parse, r.body)
+                        if not ok_json or type(resp) ~= "table" then
+                            last_err = "unparsable response from node"
+                            if attempt >= #nodes then
                                 print("  error: " .. last_err)
                                 return false
+                            end
+                        elseif resp.status == "error" then
+                            last_err = resp.stderr or "unknown error"
+                            if attempt >= #nodes then
+                                print("  error: " .. last_err)
+                                return false
+                            end
+                        else
+                            -- Success: resp.status == "ok"
+                            local output = resp.output
+                            if output then
+                                local decoded = b64_decode(output)
+                                spkg.write_file(task.output, decoded)
+                                save_fingerprint(task.output, task.cflags)
+
+                                -- Write depfile if present
+                                if resp.depfile and resp.depfile ~= "" then
+                                    local dep_path = task.output:gsub("%.o$", "%.d")
+                                    spkg.write_file(dep_path, resp.depfile)
+                                end
+
+                                task_ok = true
+                                node_idx = try_idx
+                                break
+                            else
+                                last_err = "no output from node"
+                                if attempt >= #nodes then
+                                    print("  error: " .. last_err)
+                                    return false
+                                end
                             end
                         end
                     end
@@ -1112,8 +1203,8 @@ function M.execute_tests(verbose)
         return true
     end
 
-    -- 2. Build graph
-    M.build_graph_from_ctx(b)
+    -- 2. Build graph (include test artifacts)
+    M.build_graph_from_ctx(b, true)
 
     -- 3. Build test artifacts (topological order from build_graph)
     for _, art in ipairs(build_graph.artifacts) do
