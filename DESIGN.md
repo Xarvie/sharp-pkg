@@ -895,3 +895,21 @@ cmake --build build 2>&1 | grep -c "warning:"
 | 4 | spkg_build.lua | `gsub("%.o$", "%.d")` 替换字符串中 `%` 是 Lua 模式字符 | 改为 `gsub("%.o$", ".d")` |
 | 5 | spkg_build.lua | 指纹不包含构建系统版本，`-c` 参数添加后旧指纹仍然匹配 | 添加 `BUILD_SYSTEM_VERSION = "spkg-v4"` 到指纹前缀 |
 
+### 18.6 端到端测试与 spkg update（2026-05-27）
+
+**端到端测试验证**：
+- `spkg init` ✅ 创建 Sharp.lua + SharpDeps.lua
+- `spkg build` ✅ 多 target 构建（exe + test），正确编译 + 链接
+- `spkg run` ✅ 执行第一个可执行文件，正确输出
+- `spkg test` ✅ 构建并运行测试，3 passed / 0 failed
+- 增量编译 ✅ 未修改时跳过编译，修改后重新编译
+- `spkg clean` ✅ 清空 build 目录
+
+**新功能实现**：
+
+| # | 文件 | 功能 | 说明 |
+|---|------|------|------|
+| 1 | spkg_fetch.lua | `spkg update` 命令 | 检查远程仓库最新 commit，与 Sharp.lock 对比，如有更新则重新拉取并更新 lock 文件 |
+| 2 | spkg_init.lua | 注册 `spkg update` 命令 | 添加到 help 和命令分发 |
+| 3 | spkg_build.lua | 修复 `gsub` Lua 模式问题 | `%.d` → `.d`（2 处），避免 "invalid use of '%' in replacement string" |
+

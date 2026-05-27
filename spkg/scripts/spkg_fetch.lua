@@ -188,4 +188,104 @@ function M.list_deps()
     return true
 end
 
+-- Check for updates: compare lock file with remote HEAD
+function M.check_updates(deps)
+    deps = deps or load_deps_file("SharpDeps.lua")
+    if #deps == 0 then
+        print("spkg: no dependencies to update.")
+        return true
+    end
+
+    local lock = spkg_lock.load() or {}
+    local has_update = false
+
+    for _, dep in ipairs(deps) do
+        local name = dep.name
+        local locked = lock[name]
+        if locked and locked.commit then
+            -- Resolve URL for this dep
+            local resolved = resolve_dep(dep, _SPKG_HOME or ".")
+            if resolved and resolved.url then
+                -- Fetch latest commit from remote (shallow clone to temp dir)
+                local tmpdir = "spkg_packages/.tmp_update_" .. name
+                if spkg.dir_exists(tmpdir) then spkg.remove(tmpdir) end
+
+                print("  [check] " .. name .. " (locked: " .. locked.commit:sub(1, 8) .. ")")
+                local cmd = string.format('git clone --depth 1 "%s" "%s" 2>&1', resolved.url, tmpdir)
+                local r = spkg.run_cmd(cmd)
+                if r.ok then
+                    local cmd2 = "cd '" .. tmpdir .. "' && git rev-parse HEAD"
+                    local r2 = spkg.run_cmd(cmd2)
+                    local remote_commit = r2.ok and r2.out:gsub("%s+", "") or nil
+
+                    if remote_commit and remote_commit ~= locked.commit then
+                        print("    available: " .. remote_commit:sub(1, 8) .. " (newer)")
+                        has_update = true
+                        dep.remote_commit = remote_commit
+                    else
+                        print("    up to date")
+                    end
+
+                    spkg.remove(tmpdir)
+                else
+                    print("    [warn] failed to fetch remote: " .. (r.out:gsub("\n", " ")))
+                end
+            end
+        else
+            print("  [check] " .. name .. " (not locked, will be fetched)")
+            has_update = true
+        end
+    end
+
+    return has_update
+end
+
+-- Update dependencies: re-fetch and update lock file
+function M.update_deps(home)
+    local deps = load_deps_file("SharpDeps.lua")
+    if #deps == 0 then
+        print("spkg: no dependencies to update.")
+        return true
+    end
+
+    -- Check if any updates available
+    if not M.check_updates(deps) then
+        print("spkg: all dependencies up to date.")
+        return true
+    end
+
+    -- Re-fetch each dep
+    spkg.mkdir_p("spkg_packages")
+    local lock = spkg_lock.load() or {}
+    local updated = {}
+
+    for _, dep in ipairs(deps) do
+        local name = dep.name
+        local pkg_dir = "spkg_packages/" .. name
+        local old_commit = lock[name] and lock[name].commit or nil
+
+        -- Remove old package if updated available
+        if dep.remote_commit and old_commit ~= dep.remote_commit then
+            if spkg.dir_exists(pkg_dir) then
+                spkg.remove(pkg_dir)
+                print("  [update] " .. name .. " " .. (old_commit and old_commit:sub(1, 8) or "?") .. " -> " .. dep.remote_commit:sub(1, 8))
+            end
+        end
+
+        -- Resolve and clone
+        local resolved = resolve_dep(dep, home or _SPKG_HOME)
+        if not clone_dep(resolved, pkg_dir) then
+            print("spkg: failed to update '" .. name .. "'")
+            return false
+        end
+
+        table.insert(updated, resolved)
+    end
+
+    -- Save updated lock file
+    spkg_lock.save(updated)
+    print("spkg: dependencies updated.")
+    return true
+end
+
 return M

@@ -37,6 +37,7 @@ spkg — Sharp Package Manager
   spkg test                       build + run tests
   spkg add <name>                 add a dependency to SharpDeps.lua
   spkg remove <name>              remove a dependency from SharpDeps.lua
+  spkg update                     update dependencies to latest
   spkg list                       list dependencies
   spkg clean                      remove build/, spkg_packages/, Sharp.lock
   spkg cache --stats              show cache statistics
@@ -65,6 +66,8 @@ spkg — Sharp Package Manager
         return spkg_cmd_remove(args)
     elseif cmd == "list" then
         return spkg_cmd_list()
+    elseif cmd == "update" then
+        return spkg_cmd_update()
     elseif cmd == "clean" then
         return spkg_cmd_clean()
     elseif cmd == "test" then
@@ -255,6 +258,10 @@ end
 
 function spkg_cmd_list()
     return spkg_fetch.list_deps()
+end
+
+function spkg_cmd_update()
+    return spkg_fetch.update_deps(_SPKG_HOME)
 end
 
 function spkg_cmd_clean()
