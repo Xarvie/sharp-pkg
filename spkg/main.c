@@ -102,6 +102,8 @@ static void parse_cli(int argc, char **argv, cli_args_t *out) {
             out->no_cache = 1;
         } else if (strcmp(argv[i], "--dist") == 0) {
             out->distributed = 1;
+        } else if (argv[i][0] == '-' && strncmp(argv[i], "--", 2) == 0) {
+            out->extra_args[out->extra_count++] = argv[i];
         } else if (argv[i][0] != '-') {
             if (!first_pos) {
                 out->cmd = argv[i];

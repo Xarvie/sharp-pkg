@@ -9,7 +9,7 @@ local function warn_msg(s) return COLOR(s, "yellow") end
 
 spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
-    -- ── Build context flags (passed to Sharp.lua via globals) ──
+    -- ── Build context flags (passed to config.spkg via globals) ──
     _SPKG_TARGET   = target
     _SPKG_OPTIMIZE = optimize
     _SPKG_VERBOSE  = verbose
@@ -24,7 +24,7 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no
         print([[
 spkg — Sharp Package Manager
 
-  spkg init                       create Sharp.lua
+  spkg init                       create config.spkg
   spkg build                      build current target
   spkg build --target <triple>    cross-compile
   spkg build --optimize <level>   Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
@@ -52,8 +52,8 @@ spkg — Sharp Package Manager
         return spkg_cmd_init(home)
     end
 
-    if not spkg.file_exists("Sharp.lua") then
-        print("spkg: Sharp.lua not found. Run 'spkg init' first.")
+    if not spkg.file_exists("config.spkg") then
+        print("spkg: config.spkg not found. Run 'spkg init' first.")
         return false
     end
 
@@ -84,7 +84,7 @@ spkg — Sharp Package Manager
 end
 
 -- ═══════════════════════════════════════════════════════════════
--- Lua table serializer (for Sharp.lua init template)
+-- Lua table serializer (for config.spkg init template)
 -- ═══════════════════════════════════════════════════════════════
 
 function spkg_dump_lua(val, indent)
@@ -125,13 +125,13 @@ end
 -- ═══════════════════════════════════════════════════════════════
 
 function spkg_cmd_init(home)
-    if spkg.file_exists("Sharp.lua") then
-        print("spkg: Sharp.lua already exists.")
+    if spkg.file_exists("config.spkg") then
+        print("spkg: config.spkg already exists.")
         return false
     end
     local name = spkg.dir_exists("src") and "my-project" or "untitled"
     local src = [[
--- Sharp.lua — Sharp Build System
+-- config.spkg — Sharp Build System
 -- API mirrors zig build: declare artifacts, add sources, link, install.
 
 local target   = b:get_target()
@@ -143,8 +143,8 @@ exe:add_source({ file = "src/**/*.sp" })
 exe:add_include("src")
 b:install(exe)
 ]]
-    spkg.write_file("Sharp.lua", string.format(src, name))
-    print(ok_msg("spkg: created Sharp.lua"))
+    spkg.write_file("config.spkg", string.format(src, name))
+    print(ok_msg("spkg: created config.spkg"))
 
     if not spkg.file_exists("SharpDeps.lua") then
         local deps = [[-- SharpDeps.lua — Dependency declarations

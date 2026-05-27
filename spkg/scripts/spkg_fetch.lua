@@ -198,10 +198,10 @@ function M.info(home)
 
     print("Project:")
 
-    -- Try to get project name from Sharp.lua
-    if spkg.file_exists("Sharp.lua") then
+    -- Try to get project name from config.spkg
+    if spkg.file_exists("config.spkg") then
         local ok, content = pcall(function()
-            return spkg.read_file("Sharp.lua")
+            return spkg.read_file("config.spkg")
         end)
         if ok and content then
             -- Extract name from first add_executable call

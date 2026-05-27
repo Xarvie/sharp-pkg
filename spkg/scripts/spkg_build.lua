@@ -1,7 +1,7 @@
 -- spkg_build.lua — Sharp Build System
 --
 -- Implements:
---   - Build Context (b object injected into Sharp.lua)
+--   - Build Context (b object injected into config.spkg)
 --   - Artifact objects (exe, staticlib, sharedlib)
 --   - DAG-based build graph with topological sort
 --   - Platform-aware artifact naming (.exe/.lib/.dll)
@@ -32,7 +32,7 @@ local function warn_msg(msg)
     return COLOR("warning: " .. msg, "bold_yellow")
 end
 
--- ── Build Graph (populated after running Sharp.lua) ──
+-- ── Build Graph (populated after running config.spkg) ──
 local build_graph = { artifacts = {} }
 
 -- ═══════════════════════════════════════════════════════════════
@@ -42,6 +42,41 @@ local build_graph = { artifacts = {} }
 local function is_windows()
     local plat = spkg.current_platform()
     return plat:match("windows") or plat:match("mingw")
+end
+
+local function parse_target(triple)
+    local arch, vendor, os, abi = triple:match("^([^-]+)-([^-]+)-([^-]+)-([^-]+)$")
+    if not arch then
+        local fallback = triple or ""
+        return { raw = fallback, os = fallback, arch = fallback, vendor = "", abi = "" }
+    end
+    return {
+        raw    = triple,
+        arch   = arch,
+        vendor = vendor,
+        os     = os,
+        abi    = abi,
+    }
+end
+
+local function parse_options(declared_opts)
+    local result = {}
+    for name, opt in pairs(declared_opts) do
+        result[name] = opt.default
+    end
+    for _, arg in ipairs(_SPKG_ARGS or {}) do
+        local key, val = arg:match("^%-%-([^=]+)=?(.*)$")
+        if key and declared_opts[key] then
+            if val == "true" or val == "" then
+                result[key] = true
+            elseif val == "false" then
+                result[key] = false
+            elseif val ~= "" then
+                result[key] = val
+            end
+        end
+    end
+    return result
 end
 
 local function exe_suffix()
@@ -97,6 +132,32 @@ local function create_build_context()
         return spkg.current_platform()
     end
 
+    local declared_options = {}
+    local resolved_options = nil
+
+    function ctx:option(name, opts)
+        opts = opts or {}
+        declared_options[name] = {
+            description = opts.description or "",
+            default     = opts.default,
+        }
+    end
+
+    function ctx:_resolve_options()
+        if not resolved_options then
+            resolved_options = parse_options(declared_options)
+        end
+        return resolved_options
+    end
+
+    ctx.target   = parse_target(ctx:get_target())
+    ctx.host     = parse_target(ctx:get_host())
+    ctx.options  = setmetatable({}, {
+        __index = function(_, k)
+            return ctx:_resolve_options()[k]
+        end
+    })
+
     local optimize_flags = {
         Debug        = "-O0",
         ReleaseSafe  = "-O1",
@@ -137,6 +198,14 @@ local function create_build_context()
             local args = {...}
             for _, f in ipairs(args) do
                 table.insert(self.cflags, f)
+            end
+            return self
+        end
+
+        function art:add_define(...)
+            local args = {...}
+            for _, d in ipairs(args) do
+                table.insert(self.cflags, "-D" .. d)
             end
             return self
         end
@@ -867,9 +936,9 @@ function M.execute_distributed(verbose, max_jobs)
 
     -- 1. Create build context
     b = create_build_context()
-    local ok, err = pcall(dofile, "Sharp.lua")
+    local ok, err = pcall(dofile, "config.spkg")
     if not ok then
-        print("spkg: error: failed to execute Sharp.lua")
+        print("spkg: error: failed to execute config.spkg")
         print("  " .. tostring(err))
         return false
     end
@@ -1069,9 +1138,9 @@ function M.execute_single(verbose, max_jobs)
 end
 
 function M.execute_all_targets(verbose, max_jobs)
-    -- Phase 1: Sharp.lua doesn't statically declare target list.
+    -- Phase 1: config.spkg doesn't statically declare target list.
     -- --all builds the current platform target.
-    print("spkg: --all not yet supported (Sharp.lua doesn't declare static targets).")
+    print("spkg: --all not yet supported (config.spkg doesn't declare static targets).")
     return M._do_build(verbose, max_jobs)
 end
 
@@ -1086,9 +1155,9 @@ function M._do_build(verbose, max_jobs)
     -- 1. Create build context and inject as global 'b'
     b = create_build_context()
 
-    local ok, err = pcall(dofile, "Sharp.lua")
+    local ok, err = pcall(dofile, "config.spkg")
     if not ok then
-        print("spkg: error: failed to execute Sharp.lua")
+        print("spkg: error: failed to execute config.spkg")
         local msg = tostring(err)
         local line_num = msg:match(":(%d+):")
         if line_num then
@@ -1205,15 +1274,15 @@ function M.execute_tests(verbose)
 
     -- 1. Create build context
     b = create_build_context()
-    local ok, err = pcall(dofile, "Sharp.lua")
+    local ok, err = pcall(dofile, "config.spkg")
     if not ok then
-        print(error_msg("failed to execute Sharp.lua"))
+        print(error_msg("failed to execute config.spkg"))
         print("  " .. tostring(err))
         return false
     end
 
     if #b._tests == 0 then
-        print("spkg: no tests declared (use b:add_test() in Sharp.lua)")
+        print("spkg: no tests declared (use b:add_test() in config.spkg)")
         return true
     end
 
