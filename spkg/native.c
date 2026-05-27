@@ -421,6 +421,7 @@ static int n_find_sharpc(lua_State *L) {
 
 #ifdef _WIN32
         const char *rel[] = {
+            "..\\..\\sharpc\\bin\\sharpc.exe",
             "..\\..\\..\\build\\sharpc.exe",
             "..\\..\\build\\sharpc.exe",
             "..\\build\\sharpc.exe",
@@ -429,6 +430,7 @@ static int n_find_sharpc(lua_State *L) {
         };
 #else
         const char *rel[] = {
+            "../../sharpc/bin/sharpc",
             "../../../build/sharpc",
             "../../build/sharpc",
             "../build/sharpc",

@@ -1,6 +1,12 @@
 -- spkg_init.lua — CLI entry, dispatches commands
 -- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
+-- Color helpers (module level so all commands can use them)
+local COLOR = spkg.is_tty() and spkg.colorize or function(t, _) return t end
+local function ok_msg(s) return COLOR(s, "green") end
+local function err_msg(s) return COLOR(s, "red") end
+local function warn_msg(s) return COLOR(s, "yellow") end
+
 spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
     -- ── Build context flags (passed to Sharp.lua via globals) ──
@@ -13,9 +19,6 @@ spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no
     _SPKG_NO_CACHE = no_cache or false
     _SPKG_DIST     = dist or false
     _SPKG_ARGS     = args or {}
-
-    -- Color helpers (only when output is a TTY)
-    local COLOR = spkg.is_tty() and spkg.colorize or function(t, _) return t end
 
     if cmd == "help" or cmd == "-h" or cmd == "--help" then
         print([[

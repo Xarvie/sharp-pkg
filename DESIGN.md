@@ -860,6 +860,7 @@ cmake --build build 2>&1 | grep -c "warning:"
 2. **临时文件安全**: POSIX 使用 `mkstemp()`，Windows 使用 `GetTempFileNameA()`，杜绝 `rand()` 竞态条件
 3. **动态响应构建**: HTTP 大响应（base64 编码的 .o 文件）使用精确 `malloc` + `memcpy`，避免固定大小缓冲区
 4. **snprintf 返回值检查**: 所有必要的 snprintf 调用都检查返回值，截断时返回错误而非静默失败
+5. **sharpc 集成**: sharpc 二进制已集成到 `sharpc/bin/sharpc`，spkg 可通过相对路径自动定位，也可设 `SHARPC` 环境变量
 
 ### 18.4 第二轮审查修复记录（2026-05-26）
 
@@ -881,4 +882,16 @@ cmake --build build 2>&1 | grep -c "warning:"
 | 12 | native.c:1317 | 低 | `fscanf` 未检查返回值 | 检查 fscanf == 2，失败时重置 hit/miss |
 | 13 | native.c:1104-1108 | 中等 | `n_colorize` 固定 4096 缓冲区可能截断 | 改为动态分配 `malloc(text_len + code_len + reset_len + 1)` |
 | 14 | native.c:140,152-153 | 中等 | `find_zig_near_exe` 使用 strcpy/strcat | 改用 memcpy + 编译时已知长度 |
+
+### 18.5 sharpc 集成修复记录（2026-05-27）
+
+**背景**: sharpc 二进制已集成到 `sharp-pkg/sharpc/bin/sharpc`，行为与 gcc 一致（默认 compile+link，`-c` 只编译不链接）
+
+| # | 文件 | 问题描述 | 修复方案 |
+|---|------|----------|----------|
+| 1 | spkg_init.lua | `ok_msg()` 等辅助函数定义在 `spkg_main()` 内部，`spkg_cmd_init()` 无法访问 | 移到模块级别（文件顶部） |
+| 2 | native.c | `n_find_sharpc` 搜索路径不包含 `sharpc/bin/sharpc` | 添加 `../../sharpc/bin/sharpc`（最高优先级） |
+| 3 | spkg_build.lua | `compile_task_cmd` 缺少 `-c` 参数，sharpc 默认 compile+link 产生可执行文件而非 .o | 添加 `-c` 参数（gcc 兼容行为） |
+| 4 | spkg_build.lua | `gsub("%.o$", "%.d")` 替换字符串中 `%` 是 Lua 模式字符 | 改为 `gsub("%.o$", ".d")` |
+| 5 | spkg_build.lua | 指纹不包含构建系统版本，`-c` 参数添加后旧指纹仍然匹配 | 添加 `BUILD_SYSTEM_VERSION = "spkg-v4"` 到指纹前缀 |
 

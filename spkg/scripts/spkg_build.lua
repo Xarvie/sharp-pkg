@@ -419,11 +419,13 @@ end
 -- Fingerprint (detect cflag/include changes)
 -- ═══════════════════════════════════════════════════════════════
 
+local BUILD_SYSTEM_VERSION = "spkg-v4"
+
 local function compute_fingerprint(cflags)
     local sorted = {}
     for _, f in ipairs(cflags) do table.insert(sorted, f) end
     table.sort(sorted)
-    local raw = table.concat(sorted, "|")
+    local raw = BUILD_SYSTEM_VERSION .. "|" .. table.concat(sorted, "|")
     return spkg.fingerprint(raw)
 end
 
@@ -432,7 +434,7 @@ local function needs_compile(source, output, cflags)
     if not src_mtime then
         -- Source was deleted; clean up artifacts
         if spkg.file_exists(output) then spkg.remove(output) end
-        local depfile = output:gsub("%.o$", "%.d")
+        local depfile = output:gsub("%.o$", ".d")
         if spkg.file_exists(depfile) then spkg.remove(depfile) end
         return false
     end
@@ -441,7 +443,7 @@ local function needs_compile(source, output, cflags)
     if not out_mtime then return true end
 
     -- Check .d file for header dependencies
-    local depfile = output:gsub("%.o$", "%.d")
+    local depfile = output:gsub("%.o$", ".d")
     local headers = parse_depfile(depfile)
     for _, h in ipairs(headers) do
         local h_mtime = spkg.get_mtime(h)
@@ -483,9 +485,9 @@ local function compile_task_cmd(task, verbose)
     local compiler = find_compiler()
     if not compiler then return nil end
 
-    local depfile = task.output:gsub("%.o$", "%.d")
+    local depfile = task.output:gsub("%.o$", ".d")
     local cflags_str = table.concat(task.cflags, " ")
-    return string.format('%s %s -MMD -MF "%s" "%s" -o "%s"',
+    return string.format('%s -c %s -MMD -MF "%s" "%s" -o "%s"',
         compiler, cflags_str, depfile, task.source, task.output)
 end
 

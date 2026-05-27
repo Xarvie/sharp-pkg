@@ -62,3 +62,6 @@ NUL
 
 # === 三方库内部 .git ===
 **/.git/
+
+# === sharpc (复制到 sharp/sharpc) ===
+sharpc/
