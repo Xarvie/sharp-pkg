@@ -15,6 +15,103 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <limits.h>
+
+#ifdef _WIN32
+#define PATH_SEP '\\'
+#define PATH_SEP_STR "\\"
+#else
+#define PATH_SEP '/'
+#define PATH_SEP_STR "/"
+#endif
+
+static const char *find_path_sep(const char *p) {
+    for (; *p; p++) {
+        if (*p == PATH_SEP) return p;
+#ifdef _WIN32
+        if (*p == '/') return p;
+#endif
+    }
+    return NULL;
+}
+
+static int is_executable(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    fclose(f);
+#ifdef _WIN32
+    const char *ext = strrchr(path, '.');
+    return (ext && (strcmp(ext, ".exe") == 0 || strcmp(ext, ".bat") == 0 ||
+                    strcmp(ext, ".cmd") == 0));
+#else
+    /* Check execute permission */
+    return access(path, X_OK) == 0;
+#endif
+}
+
+static int resolve_self_exe(char *buf, size_t sz) {
+#ifdef __linux__
+    ssize_t n = readlink("/proc/self/exe", buf, sz - 1);
+    if (n > 0) { buf[n] = '\0'; return 1; }
+#elif defined(__APPLE__)
+    uint32_t n = (uint32_t)sz;
+    if (_NSGetExecutablePath(buf, &n) == 0) return 1;
+#elif defined(_WIN32)
+    if (GetModuleFileNameA(NULL, buf, (DWORD)sz) > 0) return 1;
+#else
+    (void)buf; (void)sz;
+#endif
+    return 0;
+}
+
+/* Try to find sharpc relative to node binary */
+static const char *find_sharpc_path(char *buf, size_t sz) {
+    const char *env = getenv("SHARPC");
+    if (env && is_executable(env)) return env;
+
+    char self_exe[PATH_MAX];
+    if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
+
+    /* Find the LAST separator (strrchr), not the first */
+    char *slash = strrchr(self_exe, PATH_SEP);
+#ifdef _WIN32
+    if (!slash) slash = strrchr(self_exe, '/');
+#endif
+    if (!slash) return NULL;
+    *slash = '\0';
+    size_t dirlen = strlen(self_exe);
+
+#ifdef _WIN32
+    const char *rel[] = {
+        "..\\..\\sharpc\\bin\\sharpc.exe",
+        "..\\..\\..\\build\\sharpc.exe",
+        "..\\..\\build\\sharpc.exe",
+        "..\\build\\sharpc.exe",
+        "..\\sharpc.exe",
+        NULL
+    };
+#else
+    const char *rel[] = {
+        "../../sharpc/bin/sharpc",
+        "../../../build/sharpc",
+        "../../build/sharpc",
+        "../build/sharpc",
+        "../sharpc",
+        NULL
+    };
+#endif
+    for (int i = 0; rel[i]; i++) {
+        size_t rlen = strlen(rel[i]);
+        size_t need = dirlen + 1 + rlen + 1;
+        if (need > sz) continue;
+        memcpy(buf, self_exe, dirlen);
+        buf[dirlen] = PATH_SEP;
+        memcpy(buf + dirlen + 1, rel[i], rlen + 1);
+        fprintf(stderr, "[DEBUG] trying sharpc: %s\n", buf);
+        if (is_executable(buf)) return buf;
+    }
+    return NULL;
+}
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
@@ -41,40 +138,41 @@ static int json_get_str(struct mg_str json, const char *key, char *buf, size_t b
 /* Extract a JSON array of strings as pipe-separated value.
  * {"cflags":["-O2","-Iinc"]} → "-O2|-Iinc" */
 static int json_get_cflags(struct mg_str json, char *buf, size_t bufsize) {
-    size_t off = 0;
     buf[0] = '\0';
+    size_t off = 0;
 
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", "cflags");
-    const char *p = memmem(json.buf, json.len, pat, strlen(pat));
-    if (!p) return 0;
-    p += strlen(pat);
-    while (p < json.buf + json.len && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+    /* Use mg_json_get to find the cflags array */
+    int tok = mg_json_get(json, "$.cflags", NULL);
+    if (tok < 0) return 0;
+
+    const char *p = json.buf + tok;
     if (*p != '[') return 0;
     p++;
+    const char *end = json.buf + json.len;
 
-    while (p < json.buf + json.len && *p != ']') {
+    while (p < end && *p != ']') {
         if (*p == '"') {
             p++;
-            while (p < json.buf + json.len && *p != '"' && off < bufsize - 2) {
-                if (*p == '\\' && p + 1 < json.buf + json.len) { p++; }
+            while (p < end && *p != '"' && off < bufsize - 2) {
+                if (*p == '\\' && p + 1 < end) { p++; } /* skip escape */
                 buf[off++] = *p++;
             }
             buf[off++] = '|';
             if (*p == '"') p++;
         }
-        p++;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r')) p++;
     }
-    if (off > 0) off--;
-    buf[off] = '\0';
-    return (int)off;
+    if (off > 0 && buf[off - 1] == '|') buf[--off] = '\0';
+    else buf[off] = '\0';
+    return 1;
 }
 
 /* ── Compile task execution ─────────────────────────────────────── */
 
 static int compile_task(const char *source_content, const char *cflags_str,
                         const char *optimize, char *out_path, size_t out_path_size,
-                        char *depfile_content, size_t depfile_buf_size) {
+                        char *depfile_content, size_t depfile_buf_size,
+                        char *error_out, size_t error_buf_size) {
 #ifdef _WIN32
     char src_path[MAX_PATH];
     char tmp_dir[MAX_PATH];
@@ -86,18 +184,26 @@ static int compile_task(const char *source_content, const char *cflags_str,
     if (GetTempFileNameA(tmp_dir, "spk", 0, tmp_name) == 0) return -1;
     snprintf(out_path, out_path_size, "%s", tmp_name);
 #else
-    char src_path[] = "/tmp/spkg_src_XXXXXX.sp";
-    char out_template[] = "/tmp/spkg_out_XXXXXX.o";
+    char src_template[] = "/tmp/spkg_src_XXXXXX";
+    char out_template[] = "/tmp/spkg_out_XXXXXX";
 
-    /* Create unique temp files using mkstemp */
-    int src_fd = mkstemp(src_path);
+    /* Create unique temp files using mkstemp (template must end with XXXXXX) */
+    int src_fd = mkstemp(src_template);
     if (src_fd < 0) return -1;
     close(src_fd);
 
     int out_fd = mkstemp(out_template);
-    if (out_fd < 0) { remove(src_path); return -1; }
+    if (out_fd < 0) {
+        remove(src_template);
+        return -1;
+    }
     close(out_fd);
-    snprintf(out_path, out_path_size, "%s", out_template);
+
+    /* Build actual paths with extensions */
+    char src_path[PATH_MAX];
+    snprintf(src_path, sizeof(src_path), "%s.sp", src_template);
+    rename(src_template, src_path);
+    snprintf(out_path, out_path_size, "%s.o", out_template);
 #endif
 
     /* Write source to temp file */
@@ -106,7 +212,7 @@ static int compile_task(const char *source_content, const char *cflags_str,
     fputs(source_content, fp);
     fclose(fp);
 
-    /* Build command */
+    /* Build command: -c for object file (gcc compatible) */
     char cmd[4096];
     char depfile[512];
     snprintf(depfile, sizeof(depfile), "%s.d", out_path);
@@ -118,11 +224,45 @@ static int compile_task(const char *source_content, const char *cflags_str,
         else if (strcmp(optimize, "ReleaseSmall") == 0) opt_flag = "-Os";
     }
 
-    snprintf(cmd, sizeof(cmd), "%s %s %s -MMD -MF \"%s\" \"%s\" -o \"%s\"",
-             g_sharpc, opt_flag, cflags_str ? cflags_str : "",
+    /* Convert pipe-separated cflags to space-separated for shell execution */
+    char cflags_safe[2048];
+    if (cflags_str && cflags_str[0]) {
+        size_t ci = 0;
+        for (size_t i = 0; cflags_str[i] && ci < sizeof(cflags_safe) - 1; i++) {
+            cflags_safe[ci++] = (cflags_str[i] == '|') ? ' ' : cflags_str[i];
+        }
+        cflags_safe[ci] = '\0';
+    } else {
+        cflags_safe[0] = '\0';
+    }
+
+    snprintf(cmd, sizeof(cmd), "%s -c %s %s -MMD -MF \"%s\" \"%s\" -o \"%s\" 2>&1",
+             g_sharpc, opt_flag, cflags_safe,
              depfile, src_path, out_path);
 
-    int ret = system(cmd);
+    /* Capture output */
+    FILE *pfp = popen(cmd, "r");
+    int ret = -1;
+    if (pfp) {
+        if (error_out && error_buf_size > 0) {
+            size_t n = fread(error_out, 1, error_buf_size - 1, pfp);
+            error_out[n] = '\0';
+            /* Trim trailing whitespace */
+            while (n > 0 && (error_out[n-1] == '\n' || error_out[n-1] == '\r' || error_out[n-1] == ' ')) {
+                error_out[--n] = '\0';
+            }
+        }
+        int status = pclose(pfp);
+#ifdef _WIN32
+        ret = (status == 0) ? 0 : -1;
+#else
+        ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+#endif
+    } else {
+        if (error_out && error_buf_size > 0) {
+            snprintf(error_out, error_buf_size, "popen failed: %s", strerror(errno));
+        }
+    }
 
     /* Clean up source */
     remove(src_path);
@@ -176,18 +316,22 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             return;
         }
 
-        /* Parse JSON body */
-        char source[65536] = {0};
-        char cflags[2048] = {0};
-        char optimize[64] = {0};
+        /* Parse JSON body - use mg_json_get_str for dynamic allocation */
+        char *src_ptr = mg_json_get_str(hm->body, "$.source");
+        if (!src_ptr) {
+            src_ptr = mg_json_get_str(hm->body, ".source");
+        }
 
-        if (!json_get_str(hm->body, "source", source, sizeof(source))) {
+        if (!src_ptr) {
             send_json(c, 400,
                       "{\"status\":\"error\",\"code\":400,"
                       "\"stderr\":\"missing 'source' field\"}");
             return;
         }
+        const char *source = src_ptr;
 
+        char cflags[2048] = {0};
+        char optimize[64] = {0};
         json_get_cflags(hm->body, cflags, sizeof(cflags));
         json_get_str(hm->body, "optimize", optimize, sizeof(optimize));
 
@@ -196,19 +340,49 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
         char out_path[512];
         char depfile_content[4096];
+        char error_out[4096];
         int rc = compile_task(source, cflags,
                               optimize[0] ? optimize : NULL,
                               out_path, sizeof(out_path),
-                              depfile_content, sizeof(depfile_content));
+                              depfile_content, sizeof(depfile_content),
+                              error_out, sizeof(error_out));
 
         g_active--;
 
         if (rc != 0) {
-            send_json(c, 500,
-                      "{\"status\":\"error\",\"code\":1,"
-                      "\"stderr\":\"compilation failed\"}");
+            /* Escape error message for JSON */
+            char err_escaped[2048];
+            size_t ei = 0;
+            const char *err_src = (error_out[0]) ? error_out : "compilation failed";
+            for (size_t i = 0; err_src[i] && ei < sizeof(err_escaped) - 4; i++) {
+                if (err_src[i] == '\n') { err_escaped[ei++] = '\\'; err_escaped[ei++] = 'n'; }
+                else if (err_src[i] == '\r') { err_escaped[ei++] = '\\'; err_escaped[ei++] = 'r'; }
+                else if (err_src[i] == '\\') { err_escaped[ei++] = '\\'; err_escaped[ei++] = '\\'; }
+                else if (err_src[i] == '"') { err_escaped[ei++] = '\\'; err_escaped[ei++] = '"'; }
+                else { err_escaped[ei++] = err_src[i]; }
+            }
+            err_escaped[ei] = '\0';
+
+            /* Build error response with memcpy to avoid truncation warning */
+            const char *prefix = "{\"status\":\"error\",\"code\":1,\"stderr\":\"";
+            const char *suffix = "\"}";
+            size_t resp_size = strlen(prefix) + ei + strlen(suffix) + 1;
+            char *err_resp = (char *)malloc(resp_size);
+            if (!err_resp) { free(src_ptr); return; }
+            char *p = err_resp;
+            size_t n = strlen(prefix);
+            memcpy(p, prefix, n); p += n;
+            memcpy(p, err_escaped, ei); p += ei;
+            n = strlen(suffix);
+            memcpy(p, suffix, n + 1);
+
+            send_json(c, 500, err_resp);
+            free(err_resp);
+            free(src_ptr);
             return;
         }
+
+        free(src_ptr);
 
         /* Read .o file */
         FILE *fp = fopen(out_path, "rb");
@@ -355,6 +529,13 @@ int main(int argc, char *argv[]) {
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif
+
+    /* Auto-detect sharpc if not explicitly set */
+    static char sharpc_buf[PATH_MAX];
+    if (strcmp(g_sharpc, "sharpc") == 0) {
+        const char *found = find_sharpc_path(sharpc_buf, sizeof(sharpc_buf));
+        if (found) g_sharpc = found;
+    }
 
     /* Start mongoose */
     struct mg_mgr mgr;

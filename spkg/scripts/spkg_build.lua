@@ -749,6 +749,27 @@ local function b64_decode(str)
     return table.concat(result)
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- Dependency Fetching
+-- ═══════════════════════════════════════════════════════════════
+
+local function fetch_deps()
+    -- Load spkg_fetch module if not already loaded
+    if not spkg_fetch then
+        local ok, mod = pcall(dofile, "spkg_fetch.lua")
+        if not ok then
+            print("spkg: warning: cannot load spkg_fetch.lua: " .. tostring(mod))
+            return true  -- Skip fetching, not critical
+        end
+        spkg_fetch = mod
+    end
+    if spkg_fetch.fetch_recursive then
+        local home = _SPKG_HOME or "/root"
+        if not spkg_fetch.fetch_recursive(home) then return false end
+    end
+    return true
+end
+
 function M.execute_distributed(verbose, max_jobs)
     local nodes = parse_nodes()
     if #nodes == 0 then
@@ -802,56 +823,88 @@ function M.execute_distributed(verbose, max_jobs)
                     return false
                 end
 
-                -- Pick a node (round-robin)
-                node_idx = (node_idx % #nodes) + 1
-                local node = nodes[node_idx]
+                -- Try each node (round-robin starting from current idx)
+                local task_ok = false
+                local last_err = ""
+                for attempt = 1, #nodes do
+                    local try_idx = ((node_idx + attempt - 1 - 1) % #nodes) + 1
+                    local node = nodes[try_idx]
 
-                -- Build JSON request
-                local cflags_json = "["
-                for i, f in ipairs(task.cflags) do
-                    if i > 1 then cflags_json = cflags_json .. "," end
-                    cflags_json = cflags_json .. '"' .. f .. '"'
-                end
-                cflags_json = cflags_json .. "]"
-
-                local opt = _SPKG_OPTIMIZE or "Debug"
-                local req = string.format(
-                    '{"source":%s,"cflags":%s,"optimize":"%s"}',
-                    '"' .. source:gsub('"', '\\"'):gsub('\n', '\\n') .. '"',
-                    cflags_json, opt)
-
-                -- Send to node
-                if verbose then print("  [remote] " .. task.source .. " -> " .. node)
-                else print("  [remote] " .. task.source) end
-
-                local url = "http://" .. node .. "/compile"
-                local r = spkg.http_post(url, req)
-
-                if not r.ok or r.code ~= 200 then
-                    print("  error: node " .. node .. " failed (code=" .. r.code .. ")")
-                    print("  " .. r.body)
-                    return false
-                end
-
-                -- Parse response
-                local output = r.body:match('"output":"([^"]*)"')
-                if output then
-                    local decoded = b64_decode(output)
-                    spkg.write_file(task.output, decoded)
-                    save_fingerprint(task.output, task.cflags)
-
-                    -- Write depfile if present
-                    local depfile = r.body:match('"depfile":"([^"]*)"')
-                    if depfile and depfile ~= "" then
-                        -- Unescape JSON string
-                        depfile = depfile:gsub("\\n", "\n"):gsub("\\\\", "\\")
-                        local dep_path = task.output:gsub("%.o$", "%.d")
-                        spkg.write_file(dep_path, depfile)
+                    -- Build JSON request (escape source content properly)
+                    local cflags_json = "["
+                    for i, f in ipairs(task.cflags) do
+                        if i > 1 then cflags_json = cflags_json .. "," end
+                        cflags_json = cflags_json .. '"' .. f .. '"'
                     end
-                else
-                    print("  error: no output from node")
-                    return false
+                    cflags_json = cflags_json .. "]"
+
+                    local opt = _SPKG_OPTIMIZE or "Debug"
+                    -- Escape source: backslash first, then quotes and control chars
+                    local escaped = source:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+                    local req = string.format(
+                        '{"source":"%s","cflags":%s,"optimize":"%s"}',
+                        escaped, cflags_json, opt)
+
+                    -- Send to node
+                    if verbose and attempt == 1 then
+                        print("  [remote] " .. task.source .. " -> " .. node)
+                    elseif verbose and attempt > 1 then
+                        print("  [retry]  " .. task.source .. " -> " .. node)
+                    else
+                        print("  [remote] " .. task.source)
+                    end
+
+                    local url = "http://" .. node .. "/compile"
+                    local r = spkg.http_post(url, req)
+
+                    if not r.ok or r.code ~= 200 then
+                        last_err = (r.body or ""):gsub("\n", " "):sub(1, 120)
+                        if attempt < #nodes then
+                            -- Try next node
+                        else
+                            print("  error: all nodes failed for " .. task.source)
+                            print("  last error: " .. last_err)
+                            return false
+                        end
+                    else
+                        -- Parse response
+                        local output = r.body:match('"output":"([^"]*)"')
+                        if output then
+                            local decoded = b64_decode(output)
+                            spkg.write_file(task.output, decoded)
+                            save_fingerprint(task.output, task.cflags)
+
+                            -- Write depfile if present
+                            local depfile = r.body:match('"depfile":"([^"]*)"')
+                            if depfile and depfile ~= "" then
+                                -- Unescape JSON string
+                                depfile = depfile:gsub("\\n", "\n"):gsub("\\\\", "\\")
+                                local dep_path = task.output:gsub("%.o$", "%.d")
+                                spkg.write_file(dep_path, depfile)
+                            end
+
+                            task_ok = true
+                            node_idx = try_idx
+                            break
+                        else
+                            -- Check for error response
+                            local err = r.body:match('"stderr":"([^"]*)"')
+                            if err then
+                                last_err = err
+                            else
+                                last_err = "no output from node"
+                            end
+                            if attempt < #nodes then
+                                -- Try next node
+                            else
+                                print("  error: " .. last_err)
+                                return false
+                            end
+                        end
+                    end
                 end
+
+                if not task_ok then return false end
             else
                 if verbose then print("  [skip] " .. task.source .. " (up to date)") end
             end
@@ -888,16 +941,6 @@ local function execute_custom_steps(steps, verbose)
             if verbose and r.out ~= "" then print("    " .. r.out) end
         end
     end
-    return true
-end
-
--- ═══════════════════════════════════════════════════════════════
--- Dependency Fetching
--- ═══════════════════════════════════════════════════════════════
-
-local function fetch_deps()
-    local home = _SPKG_HOME or "/root"
-    if not spkg_fetch.fetch_recursive(home) then return false end
     return true
 end
 
