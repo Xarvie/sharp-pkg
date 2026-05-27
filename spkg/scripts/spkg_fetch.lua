@@ -188,6 +188,69 @@ function M.list_deps()
     return true
 end
 
+-- Show project info and dependency tree
+function M.info(home)
+    home = home or _SPKG_HOME or "."
+
+    -- Load project info
+    local deps = load_deps_file("SharpDeps.lua")
+    local lock = spkg_lock.load() or {}
+
+    print("Project:")
+
+    -- Try to get project name from Sharp.lua
+    if spkg.file_exists("Sharp.lua") then
+        local ok, content = pcall(function()
+            return spkg.read_file("Sharp.lua")
+        end)
+        if ok and content then
+            -- Extract name from first add_executable call
+            local name = content:match('name%s*=%s*"([^"]+)"')
+            if name then print("  name:     " .. name) end
+        end
+    end
+
+    print("  target:   " .. (_SPKG_TARGET or "native"))
+    print("  optimize: " .. (_SPKG_OPTIMIZE or "default"))
+
+    -- Dependencies
+    print("")
+    print("Dependencies (" .. #deps .. "):")
+    if #deps == 0 then
+        print("  (none)")
+    else
+        for i, dep in ipairs(deps) do
+            local locked = lock[dep.name]
+            local version = dep.version or "*"
+            local commit_info = ""
+            if locked then
+                if locked.commit and locked.commit ~= "" then
+                    commit_info = " @" .. locked.commit:sub(1, 8)
+                end
+            end
+
+            -- Check install status
+            local pkg_dir = "spkg_packages/" .. dep.name
+            local status = spkg.dir_exists(pkg_dir) and "installed" or "missing"
+
+            print(string.format("  [%d] %s (%s) [%s]%s", i, dep.name, version, status, commit_info))
+
+            -- Show transitive deps if present
+            local dep_deps_path = pkg_dir .. "/SharpDeps.lua"
+            if spkg.file_exists(dep_deps_path) then
+                local ok, sub_deps = pcall(dofile, dep_deps_path)
+                if ok and type(sub_deps) == "table" and #sub_deps > 0 then
+                    for _, sd in ipairs(sub_deps) do
+                        print(string.format("    └─ %s (%s)", sd.name, sd.version or "*"))
+                    end
+                end
+            end
+        end
+    end
+
+    return true
+end
+
 -- Check for updates: compare lock file with remote HEAD
 function M.check_updates(deps)
     deps = deps or load_deps_file("SharpDeps.lua")

@@ -39,6 +39,7 @@ spkg — Sharp Package Manager
   spkg remove <name>              remove a dependency from SharpDeps.lua
   spkg update                     update dependencies to latest
   spkg list                       list dependencies
+  spkg info                       show project info and dependency tree
   spkg clean                      remove build/, spkg_packages/, Sharp.lock
   spkg cache --stats              show cache statistics
   spkg cache --clear              clear entire cache
@@ -68,6 +69,8 @@ spkg — Sharp Package Manager
         return spkg_cmd_list()
     elseif cmd == "update" then
         return spkg_cmd_update()
+    elseif cmd == "info" then
+        return spkg_cmd_info()
     elseif cmd == "clean" then
         return spkg_cmd_clean()
     elseif cmd == "test" then
@@ -262,6 +265,10 @@ end
 
 function spkg_cmd_update()
     return spkg_fetch.update_deps(_SPKG_HOME)
+end
+
+function spkg_cmd_info()
+    return spkg_fetch.info(_SPKG_HOME)
 end
 
 function spkg_cmd_clean()
