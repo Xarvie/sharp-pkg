@@ -137,7 +137,8 @@ static const char *find_zig_near_exe(void) {
     if (dirlen + 1 + strlen(zig_name) < sizeof(zig_path)) {
         memcpy(zig_path, self_exe, dirlen);
         zig_path[dirlen] = PATH_SEP;
-        strcpy(zig_path + dirlen + 1, zig_name);
+        size_t zlen = strlen(zig_name);
+        memcpy(zig_path + dirlen + 1, zig_name, zlen + 1);
         if (is_executable(zig_path)) return zig_path;
     }
 
@@ -145,12 +146,18 @@ static const char *find_zig_near_exe(void) {
     char *parent_sep = (char *)find_path_sep(self_exe);
     if (parent_sep) {
         size_t pdirlen = (size_t)(parent_sep - self_exe);
-        size_t need = pdirlen + 1 + strlen(zig_name) + 4 + 1;
+#ifdef _WIN32
+        const char *rel = "zig\\zig.exe";
+        size_t rel_len = 13;
+#else
+        const char *rel = "zig/zig";
+        size_t rel_len = 7;
+#endif
+        size_t need = pdirlen + 1 + rel_len + 1;
         if (need < sizeof(zig_path)) {
             memcpy(zig_path, self_exe, pdirlen);
             zig_path[pdirlen] = PATH_SEP;
-            strcpy(zig_path + pdirlen + 1, "zig" PATH_SEP_STR);
-            strcat(zig_path, zig_name);
+            memcpy(zig_path + pdirlen + 1, rel, rel_len + 1);
             if (is_executable(zig_path)) return zig_path;
         }
     }
@@ -178,7 +185,7 @@ static int n_run_cmd(lua_State *L) {
     while (fgets(buf, sizeof(buf), fp)) {
         size_t n = strlen(buf);
         char *tmp = realloc(out, total + n + 1);
-        if (!tmp) { free(out); break; }
+        if (!tmp) { free(out); out = NULL; break; }
         out = tmp;
         memcpy(out + total, buf, n);
         total += n;
@@ -194,7 +201,7 @@ static int n_run_cmd(lua_State *L) {
 
     lua_newtable(L);
     lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
-    lua_pushstring(L, out);          lua_setfield(L, -2, "out");
+    lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
     lua_pushinteger(L, code);        lua_setfield(L, -2, "code");
 
     free(out);
@@ -375,8 +382,9 @@ static int n_read_file(lua_State *L) {
     long sz = ftell(fp); rewind(fp);
     char *buf = malloc(sz + 1);
     if (!buf) { fclose(fp); lua_pushnil(L); return 1; }
-    fread(buf, 1, sz, fp); buf[sz] = '\0';
+    size_t nread = fread(buf, 1, sz, fp);
     fclose(fp);
+    if (nread != (size_t)sz) { free(buf); lua_pushnil(L); return 1; }
     lua_pushlstring(L, buf, sz);
     free(buf);
     return 1;
@@ -390,9 +398,10 @@ static int n_write_file(lua_State *L) {
     if (!content) { lua_pushboolean(L, 0); return 1; }
     FILE *fp = fopen(path, "wb");
     if (!fp) { lua_pushboolean(L, 0); return 1; }
-    fwrite(content, 1, len, fp);
+    size_t nwrote = fwrite(content, 1, len, fp);
+    int ok = (nwrote == len);
     fclose(fp);
-    lua_pushboolean(L, 1);
+    lua_pushboolean(L, ok);
     return 1;
 }
 
@@ -688,7 +697,7 @@ static int n_wait_task(lua_State *L) {
         while (fgets(buf, sizeof(buf), fp)) {
             size_t n = strlen(buf);
             char *tmp = realloc(out, total + n + 1);
-            if (!tmp) { free(out); break; }
+            if (!tmp) { free(out); out = NULL; break; }
             out = tmp;
             memcpy(out + total, buf, n);
             total += n;
@@ -706,7 +715,7 @@ static int n_wait_task(lua_State *L) {
     lua_pushstring(L, out ? out : "");  lua_setfield(L, -2, "out");
     lua_pushinteger(L, (int)exit_code);  lua_setfield(L, -2, "code");
 
-    if (out) free(out);
+    free(out);
     return 1;
 }
 
@@ -804,7 +813,7 @@ static int n_wait_task(lua_State *L) {
         while (fgets(buf, sizeof(buf), fp)) {
             size_t n = strlen(buf);
             char *tmp = realloc(out, total + n + 1);
-            if (!tmp) { free(out); break; }
+            if (!tmp) { free(out); out = NULL; break; }
             out = tmp;
             memcpy(out + total, buf, n);
             total += n;
@@ -822,7 +831,7 @@ static int n_wait_task(lua_State *L) {
     lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
     lua_pushinteger(L, code); lua_setfield(L, -2, "code");
 
-    if (out) free(out);
+    free(out);
     return 1;
 }
 #endif
@@ -1099,11 +1108,17 @@ static int n_colorize(lua_State *L) {
         return 1;
     }
 
-    char buf[4096];
-    const char *reset = "\033[0m";
-    snprintf(buf, sizeof(buf), "%s%s%s",
-             color_codes[color_idx], text, reset);
-    lua_pushstring(L, buf);
+    /* Dynamically allocate to handle arbitrarily long text */
+    size_t text_len = strlen(text);
+    size_t code_len = strlen(color_codes[color_idx]);
+    size_t reset_len = strlen("\033[0m");
+    char *buf = malloc(text_len + code_len + reset_len + 1);
+    if (!buf) { lua_pushstring(L, text); return 1; }
+    memcpy(buf, color_codes[color_idx], code_len);
+    memcpy(buf + code_len, text, text_len);
+    memcpy(buf + code_len + text_len, "\033[0m", reset_len + 1);
+    lua_pushlstring(L, buf, code_len + text_len + reset_len);
+    free(buf);
     return 1;
 }
 
@@ -1212,12 +1227,14 @@ static int copy_file(const char *src, const char *dst) {
 
     char buf[8192];
     size_t n;
+    int ok = 1;
     while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
-        fwrite(buf, 1, n, fout);
+        if (fwrite(buf, 1, n, fout) != n) { ok = 0; break; }
     }
     fclose(fin);
     fclose(fout);
-    return 0;
+    if (!ok) remove(dst);
+    return ok ? 0 : -1;
 }
 
 /* ── spkg.cache_init() → bool ──────────────────────────────────── */
@@ -1314,7 +1331,9 @@ static int n_cache_stats(lua_State *L) {
     } else {
         FILE *fp = fopen(stats_file, "r");
         if (fp) {
-            fscanf(fp, "hit=%d miss=%d", &hit, &miss);
+            if (fscanf(fp, "hit=%d miss=%d", &hit, &miss) != 2) {
+                hit = 0; miss = 0;
+            }
             fclose(fp);
         }
     }
@@ -1521,7 +1540,7 @@ static int n_custom_exec(lua_State *L) {
     while (fgets(buf, sizeof(buf), fp)) {
         size_t n = strlen(buf);
         char *tmp = realloc(out, out_total + n + 1);
-        if (!tmp) { free(out); break; }
+        if (!tmp) { free(out); out = NULL; break; }
         out = tmp;
         memcpy(out + out_total, buf, n);
         out_total += n;
@@ -1540,7 +1559,7 @@ static int n_custom_exec(lua_State *L) {
     lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
     lua_pushinteger(L, code); lua_setfield(L, -2, "code");
 
-    if (out) free(out);
+    free(out);
     return 1;
 }
 

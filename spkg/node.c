@@ -224,16 +224,45 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         fseek(fp, 0, SEEK_SET);
 
         char *odata = (char *)malloc(osize);
-        if (!odata) { fclose(fp); remove(out_path); return; }
-        fread(odata, 1, osize, fp);
+        if (!odata) {
+            fclose(fp); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":3,"
+                      "\"stderr\":\"out of memory\"}");
+            return;
+        }
+        size_t nread = fread(odata, 1, osize, fp);
         fclose(fp);
+        if ((long)nread != osize) {
+            free(odata); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":4,"
+                      "\"stderr\":\"read .o file failed\"}");
+            return;
+        }
 
         /* Base64 encode */
-        char b64[131072];
-        size_t b64_len = mg_base64_encode((unsigned char *)odata, (size_t)osize, b64, sizeof(b64));
-        b64[b64_len] = '\0';
+        char *b64 = NULL;
+        size_t b64_len = 0;
+        /* Calculate required base64 buffer size: ceil(osize/3)*4 + 1 */
+        size_t b64_size = ((osize + 2) / 3) * 4 + 1;
+        b64 = (char *)malloc(b64_size);
+        if (!b64) {
+            free(odata); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":5,"
+                      "\"stderr\":\"out of memory\"}");
+            return;
+        }
+        b64_len = mg_base64_encode((unsigned char *)odata, (size_t)osize, b64, b64_size);
         free(odata);
-        odata = NULL; /* prevent use-after-free */
+        if (b64_len == 0) {
+            free(b64); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":6,"
+                      "\"stderr\":\"base64 encode failed\"}");
+            return;
+        }
 
         /* Escape depfile for JSON */
         char dep_escaped[8192];
@@ -257,7 +286,13 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         const char *suffix = "\",\"cached\":false}";
         size_t resp_size = strlen(prefix) + b64_len + strlen(mid) + di + strlen(suffix) + 1;
         char *resp = (char *)malloc(resp_size);
-        if (!resp) { remove(out_path); return; }
+        if (!resp) {
+            free(b64); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":7,"
+                      "\"stderr\":\"out of memory\"}");
+            return;
+        }
         char *p = resp;
         size_t n = strlen(prefix);
         memcpy(p, prefix, n); p += n;
@@ -270,6 +305,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         *p = '\0';
 
         send_json(c, 200, resp);
+        free(b64);
         free(resp);
         remove(out_path);
         return;
@@ -293,7 +329,10 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
             g_listen = argv[++i];
         } else if (strcmp(argv[i], "--max-jobs") == 0 && i + 1 < argc) {
-            g_max_jobs = atoi(argv[++i]);
+            int val = atoi(argv[++i]);
+            if (val <= 0) val = 1;
+            if (val > 64) val = 64;
+            g_max_jobs = val;
         } else if (strcmp(argv[i], "--sharpc") == 0 && i + 1 < argc) {
             g_sharpc = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {

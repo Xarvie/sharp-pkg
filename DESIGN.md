@@ -861,3 +861,24 @@ cmake --build build 2>&1 | grep -c "warning:"
 3. **动态响应构建**: HTTP 大响应（base64 编码的 .o 文件）使用精确 `malloc` + `memcpy`，避免固定大小缓冲区
 4. **snprintf 返回值检查**: 所有必要的 snprintf 调用都检查返回值，截断时返回错误而非静默失败
 
+### 18.4 第二轮审查修复记录（2026-05-26）
+
+**审查重点**: 内存安全、use-after-free、资源泄漏、错误处理完整性、第三方库使用安全
+
+| # | 文件:行 | 严重性 | 问题描述 | 修复方案 |
+|---|---------|--------|----------|----------|
+| 1 | native.c:181/197 | 严重 | `n_run_cmd` use-after-free: realloc 失败后 `out` 已 free 但 `lua_pushstring(L, out)` 直接使用 | `out = NULL` + `lua_pushstring(L, out ? out : "")` |
+| 2 | native.c:691/706 | 严重 | `n_wait_task` Windows use-after-free | 同上 |
+| 3 | native.c:807/822 | 严重 | `n_wait_task` POSIX use-after-free | 同上 |
+| 4 | native.c:1524/1540 | 严重 | `n_custom_exec` use-after-free | 同上 |
+| 5 | node.c:227 | 严重 | malloc 失败时未发送 HTTP 错误响应，客户端永久挂起 | 发送 500 错误响应 |
+| 6 | node.c:260 | 严重 | resp malloc 失败时未发送 HTTP 错误响应 | 发送 500 错误响应 + 修复 b64 泄漏 |
+| 7 | node.c:232-233 | 严重 | Base64 固定 131KB 缓冲区，大文件编码静默失败 | 改为动态分配 `((osize+2)/3)*4+1` + 检查返回值 |
+| 8 | native.c:378 | 中等 | `n_read_file` fread 返回值未检查 | 检查 nread == sz，否则返回 nil |
+| 9 | native.c:393 | 中等 | `n_write_file` fwrite 返回值未检查，磁盘满时不报错 | 检查 nwrote == len |
+| 10 | native.c:1217 | 中等 | `copy_file` fwrite 未检查，缓存可能损坏 | 检查每次 fwrite 返回值，失败时删除部分文件 |
+| 11 | node.c:332 | 低 | `--max-jobs` atoi 未校验，传入 0 导致 DoS | 限制范围 1-64 |
+| 12 | native.c:1317 | 低 | `fscanf` 未检查返回值 | 检查 fscanf == 2，失败时重置 hit/miss |
+| 13 | native.c:1104-1108 | 中等 | `n_colorize` 固定 4096 缓冲区可能截断 | 改为动态分配 `malloc(text_len + code_len + reset_len + 1)` |
+| 14 | native.c:140,152-153 | 中等 | `find_zig_near_exe` 使用 strcpy/strcat | 改用 memcpy + 编译时已知长度 |
+
