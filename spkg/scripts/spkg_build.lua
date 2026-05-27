@@ -12,6 +12,9 @@
 
 local M = {}
 
+-- Dependency visibility (matches CMake PUBLIC/PRIVATE/INTERFACE)
+local V = { PUBLIC = "public", PRIVATE = "private", INTERFACE = "interface" }
+
 -- ═══════════════════════════════════════════════════════════════
 -- Color Helpers
 -- ═══════════════════════════════════════════════════════════════
@@ -223,8 +226,15 @@ local function create_build_context()
             return self
         end
 
-        function art:link_artifact(other_art)
-            table.insert(self.link_deps, other_art.name)
+        function art:link_artifact(other_name_or_art, opts)
+            opts = opts or {}
+            local name = type(other_name_or_art) == "string"
+                and other_name_or_art
+                or other_name_or_art.name
+            table.insert(self.link_deps, {
+                name       = name,
+                visibility = opts.visibility or V.PUBLIC,
+            })
             return self
         end
 
@@ -368,6 +378,57 @@ local function topo_sort(artifacts)
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Transitive Dependency Resolution
+-- ═══════════════════════════════════════════════════════════════
+--
+-- Resolves the full dependency closure for an artifact.
+--
+-- Visibility semantics (matches CMake):
+--   "public"    — link + compile flags propagate to consumers
+--   "private"   — used for building this artifact only, NOT propagated
+--   "interface" — propagated to consumers but NOT used for self-build
+--
+-- Link order guarantee:
+--   Dependencies are emitted in topological order so that each
+--   library appears BEFORE the libraries it depends on.
+--   This matches Unix linker semantics (-lA -lB where A depends on B).
+--
+-- Returns: ordered list of { name, artifact, visibility, depth }
+
+local function collect_transitive_deps(art_name, ctx, visited, depth)
+    depth = depth or 0
+    visited = visited or {}
+    if visited[art_name] then return {} end
+    visited[art_name] = true
+
+    local art = ctx:dependency(art_name)
+    if not art then return {} end
+
+    local result = {}
+    for _, dep_entry in ipairs(art.link_deps) do
+        local dep_name, visibility = dep_entry.name, dep_entry.visibility or "public"
+        local dep_art = ctx:dependency(dep_name)
+        if dep_art then
+            if dep_art.type == "staticlib" then
+                -- Recurse into static lib deps first (they must link AFTER us)
+                local transitive = collect_transitive_deps(dep_name, ctx, visited, depth + 1)
+                for _, t in ipairs(transitive) do
+                    table.insert(result, t)
+                end
+            end
+            -- Add this dependency AFTER its own transitive deps
+            table.insert(result, {
+                name       = dep_name,
+                artifact   = dep_art,
+                visibility = visibility,
+                depth      = depth,
+            })
+        end
+    end
+    return result
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Build Graph Builder
 -- ═══════════════════════════════════════════════════════════════
 
@@ -435,27 +496,47 @@ function M.build_graph_from_ctx(ctx, include_tests)
             end
         end
 
-        -- Link inputs
+        -- Link inputs: own objects + all transitive dependency outputs
         local all_inputs = {}
         for _, task in ipairs(artifact_graph.compile_tasks) do
             table.insert(all_inputs, task.output)
         end
 
         local lflags = {}
-        for _, dep_name in ipairs(art.link_deps) do
-            local dep_art = ctx:dependency(dep_name)
-            if dep_art then
-                if dep_art.type == "staticlib" then
-                    -- sharpc does not handle .a files directly;
-                    -- pass via -L and -l flags instead
-                    table.insert(lflags, "-Lbuild/" .. dep_name)
-                    table.insert(lflags, "-l" .. dep_name)
+
+        -- Resolve ALL transitive dependencies (ordered, deduplicated)
+        local all_deps = collect_transitive_deps(art.name, ctx)
+        local seen = {}
+        for _, dep in ipairs(all_deps) do
+            if not seen[dep.name] then
+                seen[dep.name] = true
+
+                if dep.artifact.type == "staticlib" then
+                    table.insert(lflags, "-Lbuild/" .. dep.name)
+                    table.insert(lflags, "-l" .. dep.name)
+
+                    -- Propagate public/interface includes and cflags to consumer
+                    if dep.visibility ~= V.PRIVATE then
+                        for _, inc in ipairs(dep.artifact.includes or {}) do
+                            if not artifact_graph.propagated_includes then
+                                artifact_graph.propagated_includes = {}
+                            end
+                            table.insert(artifact_graph.propagated_includes, inc)
+                        end
+                        for _, cf in ipairs(dep.artifact.cflags or {}) do
+                            if not artifact_graph.propagated_cflags then
+                                artifact_graph.propagated_cflags = {}
+                            end
+                            table.insert(artifact_graph.propagated_cflags, cf)
+                        end
+                    end
                 else
-                    local dep_out = "build/" .. dep_name .. "/" .. artifact_output(dep_art)
+                    local dep_out = "build/" .. dep.name .. "/" .. artifact_output(dep.artifact)
                     table.insert(all_inputs, dep_out)
                 end
             end
         end
+
         for _, f in ipairs(art.ldflags) do table.insert(lflags, f) end
         for _, lib in ipairs(art.link_libs) do table.insert(lflags, "-l" .. lib) end
 
