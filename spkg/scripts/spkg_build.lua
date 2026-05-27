@@ -218,10 +218,13 @@ local function create_build_context()
     end
 
     function ctx:add_test(opts)
-        local name = opts and opts.name or "test"
-        local art = create_artifact(name, "exe")
+        local art = opts.artifact
+        if not art then
+            local name = opts and opts.name or "test"
+            art = create_artifact(name, "exe")
+            table.insert(artifacts, art)
+        end
         art._is_test = true
-        table.insert(artifacts, art)
         table.insert(tests, art)
         return art
     end
@@ -368,15 +371,22 @@ function M.build_graph_from_ctx(ctx, include_tests)
         for _, task in ipairs(artifact_graph.compile_tasks) do
             table.insert(all_inputs, task.output)
         end
+
+        local lflags = {}
         for _, dep_name in ipairs(art.link_deps) do
             local dep_art = ctx:dependency(dep_name)
             if dep_art then
-                local dep_out = "build/" .. dep_name .. "/" .. artifact_output(dep_art)
-                table.insert(all_inputs, dep_out)
+                if dep_art.type == "staticlib" then
+                    -- sharpc does not handle .a files directly;
+                    -- pass via -L and -l flags instead
+                    table.insert(lflags, "-Lbuild/" .. dep_name)
+                    table.insert(lflags, "-l" .. dep_name)
+                else
+                    local dep_out = "build/" .. dep_name .. "/" .. artifact_output(dep_art)
+                    table.insert(all_inputs, dep_out)
+                end
             end
         end
-
-        local lflags = {}
         for _, f in ipairs(art.ldflags) do table.insert(lflags, f) end
         for _, lib in ipairs(art.link_libs) do table.insert(lflags, "-l" .. lib) end
 
@@ -544,10 +554,14 @@ local function link_artifact(artifact, verbose)
     local atype = artifact.type
 
     if atype == "staticlib" then
+        -- Use zig ar if available, otherwise fall back to system ar
+        local ar_cmd
         local zig = spkg.find_zigcc()
-        if not zig then
-            print("spkg: zig not found (required for static library creation).")
-            return false
+        if zig then
+            ar_cmd = string.format('"%s" ar rcs', zig)
+        else
+            -- Fallback: use system ar from PATH
+            ar_cmd = "ar rcs"
         end
 
         if verbose then
@@ -562,7 +576,7 @@ local function link_artifact(artifact, verbose)
             table.insert(inputs_list, '"' .. inp .. '"')
         end
         local inputs = table.concat(inputs_list, " ")
-        local cmd = string.format('"%s" ar rcs "%s" %s', zig, link.output, inputs)
+        local cmd = string.format('%s "%s" %s', ar_cmd, link.output, inputs)
         if verbose then print("    " .. cmd) end
 
         local r = spkg.run_cmd(cmd)
