@@ -1,15 +1,23 @@
 -- spkg_init.lua — CLI entry, dispatches commands
 -- Called from C as: spkg_main(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
--- Color helpers (module level so all commands can use them)
 local COLOR = spkg.is_tty() and spkg.colorize or function(t, _) return t end
 local function ok_msg(s) return COLOR(s, "green") end
 local function err_msg(s) return COLOR(s, "red") end
 local function warn_msg(s) return COLOR(s, "yellow") end
 
+local function load_deps_from_config()
+    local ctx = spkg_build.create_build_context()
+    b = ctx
+    local ok, err = pcall(dofile, "config.spkg")
+    if not ok then
+        print("spkg: warning: config.spkg has errors: " .. tostring(err))
+    end
+    return ctx._deps or {}
+end
+
 spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
-    -- ── Build context flags (passed to config.spkg via globals) ──
     _SPKG_TARGET   = target
     _SPKG_OPTIMIZE = optimize
     _SPKG_VERBOSE  = verbose
@@ -35,8 +43,8 @@ spkg — Sharp Package Manager
   spkg build --dist               distributed build (requires spkg nodes)
   spkg run                        build + run executable
   spkg test                       build + run tests
-  spkg add <name>                 add a dependency to SharpDeps.lua
-  spkg remove <name>              remove a dependency from SharpDeps.lua
+  spkg add <name> [version]       add a dependency to config.spkg
+  spkg remove <name>              remove a dependency from config.spkg
   spkg update                     update dependencies to latest
   spkg list                       list dependencies
   spkg info                       show project info and dependency tree
@@ -83,10 +91,6 @@ spkg — Sharp Package Manager
     end
 end
 
--- ═══════════════════════════════════════════════════════════════
--- Lua table serializer (for config.spkg init template)
--- ═══════════════════════════════════════════════════════════════
-
 function spkg_dump_lua(val, indent)
     indent = indent or 0
     local t = type(val)
@@ -120,10 +124,6 @@ function spkg_dump_lua(val, indent)
     return "nil"
 end
 
--- ═══════════════════════════════════════════════════════════════
--- Commands
--- ═══════════════════════════════════════════════════════════════
-
 function spkg_cmd_init(home)
     if spkg.file_exists("config.spkg") then
         print("spkg: config.spkg already exists.")
@@ -137,6 +137,9 @@ function spkg_cmd_init(home)
 local target   = b:get_target()
 local optimize = b:get_optimize()
 
+-- ── Dependencies ──
+-- b:dep("sharp-lib", { version = "1.0.0" })
+
 -- ── Executable ──
 local exe = b:add_executable({ name = "%s" })
 exe:add_source({ file = "src/**/*.ce" })
@@ -145,17 +148,6 @@ b:install(exe)
 ]]
     spkg.write_file("config.spkg", string.format(src, name))
     print(ok_msg("spkg: created config.spkg"))
-
-    if not spkg.file_exists("SharpDeps.lua") then
-        local deps = [[-- SharpDeps.lua — Dependency declarations
--- Format: array of { name = "...", version = "..." }
--- Example:
---   { name = "sharp-lib", version = "1.0.0" },
-return {}
-]]
-        spkg.write_file("SharpDeps.lua", deps)
-        print("spkg: created SharpDeps.lua")
-    end
 
     return true
 end
@@ -188,26 +180,19 @@ function spkg_cmd_add(args)
     local name = args[1]
     local version = args[2] or "*"
 
-    -- Load existing SharpDeps.lua
-    local deps = {}
-    if spkg.file_exists("SharpDeps.lua") then
-        local ok, d = pcall(dofile, "SharpDeps.lua")
-        if ok and type(d) == "table" then deps = d end
+    local content = spkg.read_file("config.spkg")
+    if not content then
+        print("spkg: cannot read config.spkg")
+        return false
     end
 
-    -- Check if already exists
-    for _, dep in ipairs(deps) do
-        if dep.name == name then
-            print("spkg: dependency '" .. name .. "' already exists.")
-            return false
-        end
+    if content:find('b:dep%("' .. name:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0") .. '"') or content:find("b:dep%('" .. name:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0") .. "'") then
+        print("spkg: dependency '" .. name .. "' already exists in config.spkg")
+        return false
     end
 
-    table.insert(deps, { name = name, version = version })
-
-    -- Write back
-    local out = "-- SharpDeps.lua — managed by spkg\nreturn " .. spkg_dump_lua(deps)
-    spkg.write_file("SharpDeps.lua", out)
+    local dep_line = string.format('b:dep("%s", { version = "%s" })', name, version)
+    spkg.write_file("config.spkg", content .. "\n" .. dep_line .. "\n")
     print("spkg: added dependency '" .. name .. "' (" .. version .. ")")
     return true
 end
@@ -219,36 +204,24 @@ function spkg_cmd_remove(args)
     end
 
     local name = args[1]
-    if not spkg.file_exists("SharpDeps.lua") then
-        print("spkg: SharpDeps.lua not found.")
+
+    local content = spkg.read_file("config.spkg")
+    if not content then
+        print("spkg: cannot read config.spkg")
         return false
     end
 
-    local ok, deps = pcall(dofile, "SharpDeps.lua")
-    if not ok or type(deps) ~= "table" then
-        print("spkg: failed to parse SharpDeps.lua")
+    local escaped = name:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
+    local pattern = '[^\n]*b:dep%(["\']' .. escaped .. '["\'][^\n]*\n?'
+    local new_content, count = content:gsub(pattern, "")
+
+    if count == 0 then
+        print("spkg: dependency '" .. name .. "' not found in config.spkg")
         return false
     end
 
-    local found = false
-    local new_deps = {}
-    for _, dep in ipairs(deps) do
-        if dep.name == name then
-            found = true
-        else
-            table.insert(new_deps, dep)
-        end
-    end
+    spkg.write_file("config.spkg", new_content)
 
-    if not found then
-        print("spkg: dependency '" .. name .. "' not found.")
-        return false
-    end
-
-    local out = "-- SharpDeps.lua — managed by spkg\nreturn " .. spkg_dump_lua(new_deps)
-    spkg.write_file("SharpDeps.lua", out)
-
-    -- Also remove from spkg_packages if present
     local pkg_dir = "spkg_packages/" .. name
     if spkg.dir_exists(pkg_dir) then
         spkg.remove(pkg_dir)
@@ -260,15 +233,18 @@ function spkg_cmd_remove(args)
 end
 
 function spkg_cmd_list()
-    return spkg_fetch.list_deps()
+    local deps = load_deps_from_config()
+    return spkg_fetch.list_deps(deps)
 end
 
 function spkg_cmd_update()
-    return spkg_fetch.update_deps(_SPKG_HOME)
+    local deps = load_deps_from_config()
+    return spkg_fetch.update_deps(_SPKG_HOME, deps)
 end
 
 function spkg_cmd_info()
-    return spkg_fetch.info(_SPKG_HOME)
+    local deps = load_deps_from_config()
+    return spkg_fetch.info(_SPKG_HOME, deps)
 end
 
 function spkg_cmd_clean()

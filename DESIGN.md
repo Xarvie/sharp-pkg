@@ -96,6 +96,9 @@ b:add_custom_step(opts)   → CustomStep     -- 代码生成、资源编译等
 -- 获取已声明工件
 b:dependency(name)        → Artifact | nil
 
+-- 声明依赖
+b:dep(name, opts)         → void            -- opts: { version = "*", url = nil }
+
 -- 安装目标
 b:install(artifact)       → void            -- 标记为默认构建目标
 b:install(artifact, path) → void            -- 安装到指定路径
@@ -415,7 +418,7 @@ response.rsp 内容：
 ## 11. CLI 命令
 
 ```
-spkg init                        创建 Sharp.lua + SharpDeps.lua
+spkg init                        创建 config.spkg
 spkg build                       构建当前 target
 spkg build --target <triple>     构建指定 target
 spkg build --optimize <level>    Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
@@ -438,14 +441,13 @@ spkg help                        帮助
 
 ## 12. 依赖管理
 
-### 12.1 SharpDeps.lua
+### 12.1 b:dep() — 依赖声明
+
+在 config.spkg 中使用 `b:dep()` 声明依赖（类似 build.zig.zon）：
 
 ```lua
--- SharpDeps.lua（类似 build.zig.zon）
-return {
-    { name = "sharp-lib",    version = "1.0.0" },
-    { name = "sharp-logger", version = "*" },
-}
+b:dep("sharp-lib", { version = "1.0.0" })
+b:dep("sharp-logger", { version = "*" })
 ```
 
 ### 12.2 Sharp.lock
@@ -464,7 +466,7 @@ return {
 
 ### 12.3 传递依赖
 
-`spkg_fetch.fetch_recursive()` 会递归解析每个依赖自身的 `SharpDeps.lua`，用 visited 集合防止循环依赖。
+`spkg_fetch.fetch_recursive()` 会递归解析每个依赖自身的依赖声明，用 visited 集合防止循环依赖。
 
 ---
 
@@ -556,7 +558,7 @@ return {
 ```
 project/
 ├── Sharp.lua              # 构建配置（声明式）
-├── SharpDeps.lua          # 依赖声明
+├── config.spkg            # 构建配置 + 依赖声明
 ├── Sharp.lock             # 依赖锁定（自动生成）
 ├── src/
 │   ├── main.ce
@@ -898,7 +900,7 @@ cmake --build build 2>&1 | grep -c "warning:"
 ### 18.6 端到端测试与 spkg update（2026-05-27）
 
 **端到端测试验证**：
-- `spkg init` ✅ 创建 Sharp.lua + SharpDeps.lua
+- `spkg init` ✅ 创建 config.spkg
 - `spkg build` ✅ 多 target 构建（exe + test），正确编译 + 链接
 - `spkg run` ✅ 执行第一个可执行文件，正确输出
 - `spkg test` ✅ 构建并运行测试，3 passed / 0 failed

@@ -14,3 +14,4 @@ exe:add_include("src")
 exe:add_include("src/include")
 exe:link_artifact(mathlib)
 b:install(exe)
+

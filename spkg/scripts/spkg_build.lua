@@ -111,6 +111,7 @@ local function create_build_context()
     local install_list = {}
     local custom_steps = {}
     local tests = {}
+    local deps = {}
 
     function ctx:get_target()
         if _SPKG_TARGET and _SPKG_TARGET ~= "" then
@@ -279,11 +280,21 @@ local function create_build_context()
         return nil
     end
 
+    function ctx:dep(name, opts)
+        opts = opts or {}
+        table.insert(deps, {
+            name    = name,
+            version = opts.version or "*",
+            url     = opts.url,
+        })
+    end
+
     ctx._artifacts = artifacts
     ctx._install_list = install_list
     ctx._optimize_flags = optimize_flags
     ctx._custom_steps = custom_steps
     ctx._tests = tests
+    ctx._deps = deps
 
     function ctx:add_custom_step(opts)
         local step = {
@@ -995,18 +1006,18 @@ end
 -- ═══════════════════════════════════════════════════════════════
 
 local function fetch_deps()
-    -- Load spkg_fetch module if not already loaded
     if not spkg_fetch then
         local ok, mod = pcall(dofile, "spkg_fetch.lua")
         if not ok then
             print("spkg: warning: cannot load spkg_fetch.lua: " .. tostring(mod))
-            return true  -- Skip fetching, not critical
+            return true
         end
         spkg_fetch = mod
     end
     if spkg_fetch.fetch_recursive then
         local home = _SPKG_HOME or "/root"
-        if not spkg_fetch.fetch_recursive(home) then return false end
+        local deps = b and b._deps or {}
+        if not spkg_fetch.fetch_recursive(home, deps) then return false end
     end
     return true
 end
@@ -1020,10 +1031,7 @@ function M.execute_distributed(verbose, max_jobs)
         return M._do_build(verbose, max_jobs)
     end
 
-    -- 0. Fetch dependencies
-    if not fetch_deps() then return false end
-
-    -- 1. Create build context
+    -- 1. Create build context and execute config.spkg
     b = create_build_context()
     local ok, err = pcall(dofile, "config.spkg")
     if not ok then
@@ -1032,7 +1040,10 @@ function M.execute_distributed(verbose, max_jobs)
         return false
     end
 
-    -- 2. Build the graph
+    -- 2. Fetch dependencies (reads from b._deps)
+    if not fetch_deps() then return false end
+
+    -- 3. Build the graph
     M.build_graph_from_ctx(b)
 
     -- 2.5. Custom steps (always local)
@@ -1238,9 +1249,6 @@ function M._discover_targets()
 end
 
 function M._do_build(verbose, max_jobs)
-    -- 0. Fetch dependencies
-    if not fetch_deps() then return false end
-
     -- 1. Create build context and inject as global 'b'
     b = create_build_context()
 
@@ -1257,7 +1265,10 @@ function M._do_build(verbose, max_jobs)
         return false
     end
 
-    -- 2. Build the graph (DAG sorted)
+    -- 2. Fetch dependencies (reads from b._deps)
+    if not fetch_deps() then return false end
+
+    -- 3. Build the graph (DAG sorted)
     M.build_graph_from_ctx(b)
 
     -- 2.5. Execute custom steps before artifact compilation
@@ -1358,10 +1369,7 @@ M.create_build_context = create_build_context
 -- ═══════════════════════════════════════════════════════════════
 
 function M.execute_tests(verbose)
-    -- 0. Fetch dependencies
-    if not fetch_deps() then return false end
-
-    -- 1. Create build context
+    -- 1. Create build context and execute config.spkg
     b = create_build_context()
     local ok, err = pcall(dofile, "config.spkg")
     if not ok then
@@ -1369,6 +1377,9 @@ function M.execute_tests(verbose)
         print("  " .. tostring(err))
         return false
     end
+
+    -- 2. Fetch dependencies (reads from b._deps)
+    if not fetch_deps() then return false end
 
     if #b._tests == 0 then
         print("spkg: no tests declared (use b:add_test() in config.spkg)")

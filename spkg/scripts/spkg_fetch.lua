@@ -1,13 +1,12 @@
 -- spkg_fetch.lua — dependency fetching via git clone
 --
--- Reads SharpDeps.lua for dependency declarations.
+-- Reads dependencies from config.spkg (via b:dep() API).
 -- Fetches each dep into spkg_packages/<name>/.
 -- Updates Sharp.lock with resolved versions.
 -- Supports recursive fetching of transitive dependencies.
 
 local M = {}
 
--- Load SharpDeps.lua; return deps table or empty table
 local function load_deps_file(path)
     if not spkg.file_exists(path) then
         return {}
@@ -24,12 +23,10 @@ local function load_deps_file(path)
     return result
 end
 
--- Resolve a single dependency to a URL
 local function resolve_dep(dep, home)
     local name = dep.name
     local version = dep.version or "*"
 
-    -- Check Sharp.lock first
     local lock = spkg_lock.load()
     if lock and lock[name] then
         return {
@@ -41,7 +38,15 @@ local function resolve_dep(dep, home)
         }
     end
 
-    -- Read source config (~/.sharp/config.spkm)
+    if dep.url then
+        return {
+            name    = name,
+            version = version,
+            url     = dep.url,
+            tag     = version ~= "*" and ("v" .. version) or nil,
+        }
+    end
+
     local config_file = home .. "/.sharp/config.spkm"
     local config = nil
     if spkg.file_exists(config_file) then
@@ -72,11 +77,10 @@ local function resolve_dep(dep, home)
     }
 end
 
--- Clone a single dependency
 local function clone_dep(resolved, pkg_dir)
     if spkg.dir_exists(pkg_dir) then
         print("  [cached] " .. (resolved.name or "unknown"))
-        return true  -- already cloned
+        return true
     end
 
     if not resolved or not resolved.url then
@@ -103,7 +107,6 @@ local function clone_dep(resolved, pkg_dir)
         return false
     end
 
-    -- Get commit hash (avoid /tmp file race condition)
     local cmd = "cd '" .. pkg_dir .. "' && git rev-parse HEAD"
     local r = spkg.run_cmd(cmd)
     local commit = r.ok and r.out:gsub("%s+", "") or nil
@@ -116,9 +119,9 @@ local function clone_dep(resolved, pkg_dir)
     return true
 end
 
--- Fetch one level of deps from a SharpDeps.lua file, given a base directory
-local function fetch_from_deps_file(deps_path, home, visited)
-    local deps = load_deps_file(deps_path)
+local fetch_from_deps_file
+
+local function fetch_deps_list(deps, home, visited)
     if #deps == 0 then return true end
 
     spkg.mkdir_p("spkg_packages")
@@ -134,7 +137,6 @@ local function fetch_from_deps_file(deps_path, home, visited)
             return false
         end
 
-        -- Recurse into dep's SharpDeps.lua
         local dep_deps_path = pkg_dir .. "/SharpDeps.lua"
         if spkg.file_exists(dep_deps_path) then
             if not fetch_from_deps_file(dep_deps_path, home, visited) then
@@ -148,15 +150,21 @@ local function fetch_from_deps_file(deps_path, home, visited)
     return true
 end
 
--- Public: fetch all deps from project's SharpDeps.lua recursively
-function M.fetch_recursive(home)
-    local visited = {}
-    return fetch_from_deps_file("SharpDeps.lua", home, visited)
+fetch_from_deps_file = function(deps_path, home, visited)
+    local deps = load_deps_file(deps_path)
+    if #deps == 0 then return true end
+    return fetch_deps_list(deps, home, visited)
 end
 
--- Public: fetch deps (non-recursive, for backward compat)
-function M.fetch_deps(home)
-    local deps = load_deps_file("SharpDeps.lua")
+function M.fetch_recursive(home, deps)
+    deps = deps or {}
+    if #deps == 0 then return true end
+    local visited = {}
+    return fetch_deps_list(deps, home, visited)
+end
+
+function M.fetch_deps(home, deps)
+    deps = deps or {}
     if #deps == 0 then return true end
 
     spkg.mkdir_p("spkg_packages")
@@ -172,9 +180,8 @@ function M.fetch_deps(home)
     return true
 end
 
--- List dependencies
-function M.list_deps()
-    local deps = load_deps_file("SharpDeps.lua")
+function M.list_deps(deps)
+    deps = deps or {}
     if #deps == 0 then
         print("spkg: no dependencies declared.")
         return true
@@ -188,23 +195,19 @@ function M.list_deps()
     return true
 end
 
--- Show project info and dependency tree
-function M.info(home)
+function M.info(home, deps)
     home = home or _SPKG_HOME or "."
+    deps = deps or {}
 
-    -- Load project info
-    local deps = load_deps_file("SharpDeps.lua")
     local lock = spkg_lock.load() or {}
 
     print("Project:")
 
-    -- Try to get project name from config.spkg
     if spkg.file_exists("config.spkg") then
         local ok, content = pcall(function()
             return spkg.read_file("config.spkg")
         end)
         if ok and content then
-            -- Extract name from first add_executable call
             local name = content:match('name%s*=%s*"([^"]+)"')
             if name then print("  name:     " .. name) end
         end
@@ -213,7 +216,6 @@ function M.info(home)
     print("  target:   " .. (_SPKG_TARGET or "native"))
     print("  optimize: " .. (_SPKG_OPTIMIZE or "default"))
 
-    -- Dependencies
     print("")
     print("Dependencies (" .. #deps .. "):")
     if #deps == 0 then
@@ -229,13 +231,11 @@ function M.info(home)
                 end
             end
 
-            -- Check install status
             local pkg_dir = "spkg_packages/" .. dep.name
             local status = spkg.dir_exists(pkg_dir) and "installed" or "missing"
 
             print(string.format("  [%d] %s (%s) [%s]%s", i, dep.name, version, status, commit_info))
 
-            -- Show transitive deps if present
             local dep_deps_path = pkg_dir .. "/SharpDeps.lua"
             if spkg.file_exists(dep_deps_path) then
                 local ok, sub_deps = pcall(dofile, dep_deps_path)
@@ -251,9 +251,8 @@ function M.info(home)
     return true
 end
 
--- Check for updates: compare lock file with remote HEAD
 function M.check_updates(deps)
-    deps = deps or load_deps_file("SharpDeps.lua")
+    deps = deps or {}
     if #deps == 0 then
         print("spkg: no dependencies to update.")
         return true
@@ -266,10 +265,8 @@ function M.check_updates(deps)
         local name = dep.name
         local locked = lock[name]
         if locked and locked.commit then
-            -- Resolve URL for this dep
             local resolved = resolve_dep(dep, _SPKG_HOME or ".")
             if resolved and resolved.url then
-                -- Fetch latest commit from remote (shallow clone to temp dir)
                 local tmpdir = "spkg_packages/.tmp_update_" .. name
                 if spkg.dir_exists(tmpdir) then spkg.remove(tmpdir) end
 
@@ -303,21 +300,18 @@ function M.check_updates(deps)
     return has_update
 end
 
--- Update dependencies: re-fetch and update lock file
-function M.update_deps(home)
-    local deps = load_deps_file("SharpDeps.lua")
+function M.update_deps(home, deps)
+    deps = deps or {}
     if #deps == 0 then
         print("spkg: no dependencies to update.")
         return true
     end
 
-    -- Check if any updates available
     if not M.check_updates(deps) then
         print("spkg: all dependencies up to date.")
         return true
     end
 
-    -- Re-fetch each dep
     spkg.mkdir_p("spkg_packages")
     local lock = spkg_lock.load() or {}
     local updated = {}
@@ -327,7 +321,6 @@ function M.update_deps(home)
         local pkg_dir = "spkg_packages/" .. name
         local old_commit = lock[name] and lock[name].commit or nil
 
-        -- Remove old package if updated available
         if dep.remote_commit and old_commit ~= dep.remote_commit then
             if spkg.dir_exists(pkg_dir) then
                 spkg.remove(pkg_dir)
@@ -335,7 +328,6 @@ function M.update_deps(home)
             end
         end
 
-        -- Resolve and clone
         local resolved = resolve_dep(dep, home or _SPKG_HOME)
         if not clone_dep(resolved, pkg_dir) then
             print("spkg: failed to update '" .. name .. "'")
@@ -345,7 +337,6 @@ function M.update_deps(home)
         table.insert(updated, resolved)
     end
 
-    -- Save updated lock file
     spkg_lock.save(updated)
     print("spkg: dependencies updated.")
     return true

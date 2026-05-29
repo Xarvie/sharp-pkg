@@ -103,7 +103,7 @@ spkg test
 ## CLI 命令参考
 
 ```
-spkg init                       创建 config.spkg + SharpDeps.lua
+spkg init                       创建 config.spkg
 spkg build                      构建当前 target
 spkg build --target <triple>    交叉编译到指定 target
 spkg build --optimize <level>   设置优化级别
@@ -114,8 +114,8 @@ spkg build --no-cache           禁用编译缓存
 spkg build --dist               启用分布式编译
 spkg run                        构建 + 运行第一个可执行文件
 spkg test                       构建 + 运行所有测试
-spkg add <name> [version]       添加依赖到 SharpDeps.lua
-spkg remove <name>              从 SharpDeps.lua 移除依赖
+spkg add <name> [version]       添加依赖到 config.spkg
+spkg remove <name>              从 config.spkg 移除依赖
 spkg update                     更新依赖到最新版本
 spkg list                       列出依赖及其状态
 spkg info                       显示项目信息和依赖树
@@ -222,6 +222,7 @@ b:install(exe)
 |------|---------|------|
 | `b:install(artifact)` | `Artifact` | 标记为默认构建目标 |
 | `b:dependency(name)` | `Artifact | nil` | 获取已声明的工件 |
+| `b:dep(name, opts)` | `void` | 声明依赖（替代 SharpDeps.lua） |
 | `b:add_custom_step(opts)` | `CustomStep` | 添加自定义构建步骤 |
 | `b:add_test(opts)` | `Artifact` | 声明测试工件 |
 
@@ -395,19 +396,26 @@ spkg test
 
 ## 依赖管理
 
-### SharpDeps.lua — 依赖声明
+### b:dep() — 依赖声明
+
+在 `config.spkg` 中使用 `b:dep()` 声明依赖：
 
 ```lua
-return {
-    { name = "sharp-lib",    version = "1.0.0" },
-    { name = "sharp-logger", version = "*" },
-}
+b:dep("sharp-lib", { version = "1.0.0" })
+b:dep("sharp-logger", { version = "*" })
 ```
 
-| 字段 | 说明 |
+| 参数 | 说明 |
 |------|------|
-| `name` | 依赖包名称 |
-| `version` | 版本号，`"*"` 表示最新版 |
+| `name` | 依赖包名称（第一个参数） |
+| `opts.version` | 版本号，`"*"` 表示最新版 |
+| `opts.url` | 自定义 git 仓库 URL（可选，覆盖默认源） |
+
+也可以使用 `spkg add` 命令添加依赖：
+
+```bash
+spkg add sharp-lib 1.0.0
+```
 
 ### Sharp.lock — 依赖锁定（自动生成）
 
@@ -443,7 +451,7 @@ return {
 
 ### 传递依赖
 
-spkg 会递归解析每个依赖自身的 `SharpDeps.lua`，使用 visited 集合防止循环依赖。
+spkg 会递归解析每个依赖自身的依赖声明，使用 visited 集合防止循环依赖。
 
 ### CLI 操作
 
@@ -673,8 +681,7 @@ spkg build --dist
 
 ```
 project/
-├── config.spkg              # 构建配置（声明式，必需）
-├── SharpDeps.lua            # 依赖声明
+├── config.spkg              # 构建配置 + 依赖声明（必需）
 ├── Sharp.lock               # 依赖锁定（自动生成）
 ├── spkg_nodes.json          # 分布式节点配置（可选）
 ├── src/
