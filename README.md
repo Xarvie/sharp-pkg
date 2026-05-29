@@ -83,7 +83,7 @@ spkg init
 
 # 2. 编写源码
 mkdir -p src
-echo 'fn main() { print("Hello, Sharp!") }' > src/main.sp
+echo 'fn main() { print("Hello, Sharp!") }' > src/main.ce
 
 # 3. 构建
 spkg build
@@ -144,7 +144,7 @@ spkg help                       显示帮助信息
 
 ```lua
 local exe = b:add_executable({ name = "myapp" })
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 exe:add_include("src")
 b:install(exe)
 ```
@@ -156,13 +156,13 @@ local target = b:get_target()
 
 -- 静态库
 local mathlib = b:add_static_library({ name = "mathlib" })
-mathlib:add_source({ file = "src/math.sp" })
+mathlib:add_source({ file = "src/math.ce" })
 mathlib:add_include("src/include")
 b:install(mathlib)
 
 -- 可执行文件
 local exe = b:add_executable({ name = "myapp" })
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 exe:add_include("src")
 exe:add_include("src/include")
 exe:link_artifact(mathlib)
@@ -175,16 +175,16 @@ b:install(exe)
 local target = b:get_target()
 
 local exe = b:add_executable({ name = "myapp" })
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 
 if target:match("linux") then
-    exe:add_source({ file = "src/platform_linux.sp", cflags = {"-DLINUX"} })
+    exe:add_source({ file = "src/platform_linux.ce", cflags = {"-DLINUX"} })
     exe:link_library("pthread")
 elseif target:match("mingw") or target:match("windows") then
-    exe:add_source({ file = "src/platform_win.sp", cflags = {"-DWIN32"} })
+    exe:add_source({ file = "src/platform_win.ce", cflags = {"-DWIN32"} })
     exe:link_library("ws2_32")
 elseif target:match("apple") or target:match("darwin") then
-    exe:add_source({ file = "src/platform_macos.sp", cflags = {"-DMACOS"} })
+    exe:add_source({ file = "src/platform_macos.ce", cflags = {"-DMACOS"} })
 end
 
 b:install(exe)
@@ -262,11 +262,11 @@ local exe = b:add_executable({ name = "myapp" })
 
 ```lua
 -- 简写：字符串路径
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 
 -- 结构体：支持 glob 模式和文件级编译选项
 exe:add_source({
-    file    = "src/features/**/*.sp",
+    file    = "src/features/**/*.ce",
     cflags  = {"-DFEATURE_X"},
     include = {"src/features/include"},
     define  = {"VERSION=1.0"},
@@ -319,11 +319,11 @@ exe:set_run_args("--verbose", "--port=8080")
 
 ```lua
 -- 字符串：等价于 { file = "..." }
-artifact:add_source("src/main.sp")
+artifact:add_source("src/main.ce")
 
 -- 结构体
 artifact:add_source({
-    file    = "src/platform.sp",       -- 单个文件或 glob 模式（支持 **）
+    file    = "src/platform.ce",       -- 单个文件或 glob 模式（支持 **）
     cflags  = {"-DLINUX"},             -- 仅此文件的额外编译标志
     include = {"include/linux"},       -- 仅此文件的额外包含路径
     define  = {"VERSION=1.0"},         -- 宏定义（自动加 -D 前缀）
@@ -331,8 +331,8 @@ artifact:add_source({
 ```
 
 glob 模式示例：
-- `"src/**/*.sp"` — 递归匹配 src 下所有 .sp 文件
-- `"src/*.sp"` — 匹配 src 目录下的 .sp 文件
+- `"src/**/*.ce"` — 递归匹配 src 下所有 .ce 文件
+- `"src/*.ce"` — 匹配 src 目录下的 .ce 文件
 
 ---
 
@@ -367,7 +367,7 @@ Custom Step 的执行逻辑：
 local test_exe = b:add_test({
     name = "myapp_test",
 })
-test_exe:add_source("tests/**/*.sp")
+test_exe:add_source("tests/**/*.ce")
 test_exe:link_artifact(myapp)
 ```
 
@@ -486,7 +486,7 @@ spkg 使用三重检测机制实现精确的增量编译：
 | 条件 | 动作 |
 |------|------|
 | `.o` 不存在 | **编译** |
-| `.sp` 比 `.o` 新 | **编译** |
+| `.ce` 比 `.o` 新 | **编译** |
 | 任何 `#include` 的头文件比 `.o` 新 | **编译**（通过 `.d` 依赖文件） |
 | 编译命令（cflags）改变 | **编译**（命令指纹对比） |
 | 源文件被删除 | **清理残留 `.o` 和 `.d`** |
@@ -497,7 +497,7 @@ spkg 使用三重检测机制实现精确的增量编译：
 编译时自动加 `-MMD -MF <output>.d` 生成 Makefile 风格的依赖文件：
 
 ```
-build/myapp/main.o: src/main.sp src/include/header.sp
+build/myapp/main.o: src/main.ce src/include/header.he
 ```
 
 ### 命令指纹
@@ -678,9 +678,9 @@ project/
 ├── Sharp.lock               # 依赖锁定（自动生成）
 ├── spkg_nodes.json          # 分布式节点配置（可选）
 ├── src/
-│   ├── main.sp
+│   ├── main.ce
 │   └── include/
-│       └── header.sp
+│       └── header.he
 ├── build/                   # 构建产物（自动生成）
 │   ├── myapp/
 │   │   ├── main.o

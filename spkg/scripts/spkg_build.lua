@@ -486,7 +486,7 @@ function M.build_graph_from_ctx(ctx, include_tests)
             end
 
             for _, fp in ipairs(files) do
-                local stem = fp:gsub("%.sp$", ""):gsub("[/\\]", "_")
+                local stem = fp:gsub("%.ce$", ""):gsub("[/\\]", "_")
                 local output = "build/" .. art.name .. "/" .. stem .. ".o"
                 table.insert(artifact_graph.compile_tasks, {
                     source = fp,
@@ -629,6 +629,14 @@ local function save_fingerprint(output, cflags)
     spkg.write_file(fp_file, fp)
 end
 
+local function file_content_fingerprint(filepath)
+    local content = spkg.read_file(filepath)
+    if content then
+        return spkg.fingerprint(content)
+    end
+    return spkg.fingerprint(filepath)
+end
+
 -- ═══════════════════════════════════════════════════════════════
 -- Compiler / Linker Execution
 -- ═══════════════════════════════════════════════════════════════
@@ -656,7 +664,7 @@ local function compile_task(task, verbose)
     if not _SPKG_NO_CACHE then
         spkg.cache_init()
         local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                          spkg.fingerprint(task.source)
+                          file_content_fingerprint(task.source)
         if spkg.cache_get(cache_key, task.output) then
             if verbose then print("  [cache hit] " .. task.source) end
             save_fingerprint(task.output, task.cflags)
@@ -682,7 +690,7 @@ local function compile_task(task, verbose)
     -- Save to cache (unless --no-cache)
     if not _SPKG_NO_CACHE then
         local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                          spkg.fingerprint(task.source)
+                          file_content_fingerprint(task.source)
         spkg.cache_put(cache_key, task.output)
     end
 
@@ -789,7 +797,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
         if not _SPKG_NO_CACHE then
             spkg.cache_init()
             local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                              spkg.fingerprint(task.source)
+                              file_content_fingerprint(task.source)
             if spkg.cache_get(cache_key, task.output) then
                 if verbose then print("  [cache hit] " .. task.source) end
                 save_fingerprint(task.output, task.cflags)
@@ -843,7 +851,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                     save_fingerprint(r.item.task.output, r.item.task.cflags)
                     if not _SPKG_NO_CACHE then
                         local cache_key = compute_fingerprint(r.item.task.cflags) .. "_" ..
-                                          spkg.fingerprint(r.item.task.source)
+                                          file_content_fingerprint(r.item.task.source)
                         spkg.cache_put(cache_key, r.item.task.output)
                     end
                 end

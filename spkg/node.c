@@ -293,7 +293,7 @@ static int compile_task(const char *source_content, const char *cflags_str,
 
     /* Build actual paths with extensions */
     char src_path[PATH_MAX];
-    snprintf(src_path, sizeof(src_path), "%s.sp", src_template);
+    snprintf(src_path, sizeof(src_path), "%s.ce", src_template);
     rename(src_template, src_path);
     snprintf(out_path, out_path_size, "%s.o", out_template);
 #endif

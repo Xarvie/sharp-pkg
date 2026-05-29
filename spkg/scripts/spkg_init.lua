@@ -139,7 +139,7 @@ local optimize = b:get_optimize()
 
 -- ── Executable ──
 local exe = b:add_executable({ name = "%s" })
-exe:add_source({ file = "src/**/*.sp" })
+exe:add_source({ file = "src/**/*.ce" })
 exe:add_include("src")
 b:install(exe)
 ]]

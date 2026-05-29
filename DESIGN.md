@@ -107,9 +107,9 @@ b:install(artifact, path) → void            -- 安装到指定路径
 local exe = b:add_executable({ name = "myapp" })
 
 -- 源文件管理
-exe:add_source("src/main.sp")                     -- 简写
+exe:add_source("src/main.ce")                     -- 简写
 exe:add_source({
-    file    = "src/features/**/*.sp",             -- glob 模式
+    file    = "src/features/**/*.ce",             -- glob 模式
     cflags  = {"-DFEATURE_X"},
     include = {"src/features/include"},
 })
@@ -135,11 +135,11 @@ b:install(exe)
 
 ```lua
 -- 字符串：等价于 { file = "..." }
-artifact:add_source("src/main.sp")
+artifact:add_source("src/main.ce")
 
 -- 结构体
 {
-    file    = "src/platform.sp",       -- 单个文件或 glob 模式
+    file    = "src/platform.ce",       -- 单个文件或 glob 模式
     cflags  = {"-DLINUX"},             -- 仅此文件的额外编译标志
     include = {"include/linux"},       -- 仅此文件的额外包含路径
     define  = {"VERSION=1.0"},         -- 宏定义
@@ -167,16 +167,16 @@ exe:add_source("build/proto/message_pb.lua")
 local target = b:get_target()
 
 local exe = b:add_executable({ name = "myapp" })
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 
 if target:match("linux") then
-    exe:add_source({ file = "src/platform_linux.sp", cflags = {"-DLINUX"} })
+    exe:add_source({ file = "src/platform_linux.ce", cflags = {"-DLINUX"} })
     exe:link_library("pthread")
 elseif target:match("mingw") or target:match("windows") then
-    exe:add_source({ file = "src/platform_win.sp", cflags = {"-DWIN32"} })
+    exe:add_source({ file = "src/platform_win.ce", cflags = {"-DWIN32"} })
     exe:link_library("ws2_32")
 elseif target:match("apple") or target:match("darwin") then
-    exe:add_source({ file = "src/platform_macos.sp", cflags = {"-DMACOS"} })
+    exe:add_source({ file = "src/platform_macos.ce", cflags = {"-DMACOS"} })
 end
 
 b:install(exe)
@@ -202,7 +202,7 @@ build_graph = {
             dependencies = {"mathlib"},          -- 依赖其他 artifact
             compile_tasks = {
                 {
-                    source = "src/main.sp",
+                    source = "src/main.ce",
                     output = "build/myapp/main.o",
                     cflags = {"-O2", "-Iinclude", "-Isrc"},
                     depfile = "build/myapp/main.o.d",
@@ -249,7 +249,7 @@ C 层执行 DAG 拓扑排序（Kahn 算法），确定编译顺序：
 | 条件 | 动作 |
 |------|------|
 | `.o` 不存在 | **编译** |
-| `.sp` 比 `.o` 新 | **编译** |
+| `.ce` 比 `.o` 新 | **编译** |
 | 任何 `#include` 的头文件比 `.o` 新 | **编译**（通过 `.d` 依赖文件） |
 | 编译命令（cflags）改变 | **编译**（命令指纹对比） |
 | 源文件被删除 | **清理残留 `.o` 和 `.d`** |
@@ -260,7 +260,7 @@ C 层执行 DAG 拓扑排序（Kahn 算法），确定编译顺序：
 编译时自动加 `-MMD -MF <output>.d` 生成 Makefile 风格的 `.d` 依赖文件：
 
 ```
-build/myapp/main.o: src/main.sp src/include/header.sp
+build/myapp/main.o: src/main.ce src/include/header.he
 ```
 
 ### 6.3 命令指纹（Command Fingerprint）
@@ -559,9 +559,9 @@ project/
 ├── SharpDeps.lua          # 依赖声明
 ├── Sharp.lock             # 依赖锁定（自动生成）
 ├── src/
-│   ├── main.sp
+│   ├── main.ce
 │   └── include/
-│       └── header.sp
+│       └── header.he
 ├── build/
 │   ├── myapp/
 │   │   ├── main.o
@@ -592,7 +592,7 @@ $HOME/.spkg-cache/          # 全局编译缓存（Phase 2）
 
 ```lua
 -- 用户输入（所有平台统一）
-exe:add_source("src/main.sp")
+exe:add_source("src/main.ce")
 exe:add_include("include")
 
 -- spkg 内部也统一使用 /
@@ -696,7 +696,7 @@ Content-Type: application/json
 Content-Length: 256
 
 {
-  "source": "src/main.sp",
+  "source": "src/main.ce",
   "source_hash": "sha256:abc123...",
   "cflags": ["-O2", "-Iinclude"],
   "target": "x86_64-pc-linux-gnu",
@@ -717,7 +717,7 @@ Content-Type: application/json
 {
   "status": "ok",
   "output": "<base64 .o content>",
-  "depfile": "build/main.o: src/main.sp src/include/header.sp\n",
+  "depfile": "build/main.o: src/main.ce src/include/header.he\n",
   "cached": false
 }
 ```
@@ -789,7 +789,7 @@ end
 ### 17.1 彩色诊断输出
 
 ```
-error: src/main.sp:42:10: expected ';' after expression
+error: src/main.ce:42:10: expected ';' after expression
     let x = foo()
              ^
              ;
@@ -800,7 +800,7 @@ error: src/main.sp:42:10: expected ';' after expression
 ```lua
 -- 在 Sharp.lua 中声明测试
 local test_exe = b:add_executable({ name = "myapp_test" })
-test_exe:add_source("tests/**/*.sp")
+test_exe:add_source("tests/**/*.ce")
 test_exe:link_artifact(myapp)
 b:install(test_exe)
 
