@@ -53,6 +53,9 @@
     #include <glob.h>
     #include <limits.h>
     #include <sys/wait.h>
+    #include <dirent.h>
+    #include <pwd.h>
+    #include <fcntl.h>
     #define PATH_SEP '/'
     #define PATH_SEP_STR "/"
 #endif
@@ -87,7 +90,7 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
     buf[n] = '\0';
     return buf;
 #elif defined(__APPLE__)
-    uint32_t size = (uint32_t)bufsize;
+    uint32_t size = bufsize > UINT32_MAX ? UINT32_MAX : (uint32_t)bufsize;
     if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
     char tmp[PATH_MAX];
     char *real = realpath(buf, tmp);
@@ -106,12 +109,10 @@ static const char *resolve_self_exe(char *buf, size_t bufsize) {
 }
 
 /* Find path separator (handles both / and \) */
-static const char *find_path_sep(const char *path) {
-    const char *last = NULL;
-    const char *p = path;
-    while (*p) {
+static char *find_path_sep(char *path) {
+    char *last = NULL;
+    for (char *p = path; *p; p++) {
         if (*p == '/' || *p == '\\') last = p;
-        p++;
     }
     return last;
 }
@@ -122,7 +123,7 @@ static const char *find_zig_near_exe(void) {
     char self_exe[PATH_MAX];
     if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
 
-    char *slash = (char *)find_path_sep(self_exe);
+    char *slash = find_path_sep(self_exe);
     if (!slash) return NULL;
     *slash = '\0';
     size_t dirlen = strlen(self_exe);
@@ -143,7 +144,7 @@ static const char *find_zig_near_exe(void) {
     }
 
     /* Priority 1b: {self_dir}/../zig/zig */
-    char *parent_sep = (char *)find_path_sep(self_exe);
+    char *parent_sep = find_path_sep(self_exe);
     if (parent_sep) {
         size_t pdirlen = (size_t)(parent_sep - self_exe);
 #ifdef _WIN32
@@ -162,8 +163,100 @@ static const char *find_zig_near_exe(void) {
         }
     }
 
+    /* Priority 1c: {self_dir}/../../sharpc/zig/zig  (sharp monorepo layout:
+       spkg binary is at <root>/sharp-pkg/spkg/build/spkg,
+       zig   is at <root>/sharp-pkg/sharpc/zig/zig) */
+    if (parent_sep) {
+        char *grandparent_path = self_exe;
+        *parent_sep = '\0';
+        char *grandparent_sep = find_path_sep(grandparent_path);
+        if (grandparent_sep) {
+            size_t gpdirlen = (size_t)(grandparent_sep - grandparent_path);
+#ifdef _WIN32
+            const char *rel2 = "sharpc\\zig\\zig.exe";
+            size_t rel2_len = 20;
+#else
+            const char *rel2 = "sharpc/zig/zig";
+            size_t rel2_len = 14;
+#endif
+            size_t need2 = gpdirlen + 1 + rel2_len + 1;
+            if (need2 < sizeof(zig_path)) {
+                memcpy(zig_path, grandparent_path, gpdirlen);
+                zig_path[gpdirlen] = PATH_SEP;
+                memcpy(zig_path + gpdirlen + 1, rel2, rel2_len + 1);
+                if (is_executable(zig_path)) return zig_path;
+            }
+        }
+    }
+
     return NULL;
 }
+
+#ifndef _WIN32
+static int mkdir_p_native(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    }
+
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp)) return -1;
+    memcpy(tmp, path, len + 1);
+
+    for (size_t i = 1; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            struct stat st2;
+            if (stat(tmp, &st2) != 0) {
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+            }
+            tmp[i] = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static int remove_recursive(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+
+    if (!S_ISDIR(st.st_mode)) {
+        return unlink(path);
+    }
+
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+
+    struct dirent *entry;
+    int ret = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        char subpath[PATH_MAX];
+        size_t plen = strlen(path);
+        size_t nlen = strlen(entry->d_name);
+        if (plen + 1 + nlen >= sizeof(subpath)) {
+            ret = -1;
+            break;
+        }
+        memcpy(subpath, path, plen);
+        subpath[plen] = '/';
+        memcpy(subpath + plen + 1, entry->d_name, nlen + 1);
+
+        if (remove_recursive(subpath) != 0) {
+            ret = -1;
+            break;
+        }
+    }
+    closedir(dir);
+
+    if (ret == 0 && rmdir(path) != 0) ret = -1;
+    return ret;
+}
+#endif
 
 /* ── spkg.run_cmd ────────────────────────────────────────────────── */
 static int n_run_cmd(lua_State *L) {
@@ -180,6 +273,14 @@ static int n_run_cmd(lua_State *L) {
     char buf[4096];
     size_t total = 0;
     char *out = malloc(1);
+    if (!out) {
+        pclose(fp);
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "out of memory"); lua_setfield(L, -2, "out");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        return 1;
+    }
     out[0] = '\0';
 
     while (fgets(buf, sizeof(buf), fp)) {
@@ -266,14 +367,7 @@ static int n_mkdir_p(lua_State *L) {
     int r = win_mkdir_p(path);
     lua_pushboolean(L, r == 0);
 #else
-    struct stat st;
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        lua_pushboolean(L, 1); return 1;
-    }
-    char cmd[PATH_MAX + 32];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
-    int r = system(cmd);
-    lua_pushboolean(L, r == 0);
+    lua_pushboolean(L, mkdir_p_native(path) == 0);
 #endif
     return 1;
 }
@@ -366,7 +460,7 @@ static int n_glob(lua_State *L) {
     lua_newtable(L);
     if (rc == 0) {
         for (size_t i = 0; i < g.gl_pathc; i++)
-        { lua_pushstring(L, g.gl_pathv[i]); lua_rawseti(L, -2, (int)(i+1)); }
+        { lua_pushstring(L, g.gl_pathv[i]); lua_rawseti(L, -2, (lua_Integer)(i+1)); }
     }
     globfree(&g);
     return 1;
@@ -380,7 +474,8 @@ static int n_read_file(lua_State *L) {
     if (!fp) { lua_pushnil(L); return 1; }
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp); rewind(fp);
-    char *buf = malloc(sz + 1);
+    if (sz < 0) { fclose(fp); lua_pushnil(L); return 1; }
+    char *buf = malloc((size_t)sz + 1);
     if (!buf) { fclose(fp); lua_pushnil(L); return 1; }
     size_t nread = fread(buf, 1, sz, fp);
     fclose(fp);
@@ -415,7 +510,7 @@ static int n_find_sharpc(lua_State *L) {
     char self_exe[PATH_MAX];
     char cand[PATH_MAX];
     if (resolve_self_exe(self_exe, sizeof(self_exe))) {
-        char *slash = (char *)find_path_sep(self_exe);
+        char *slash = find_path_sep(self_exe);
         if (slash) *slash = '\0';
         size_t dirlen = strlen(self_exe);
 
@@ -501,7 +596,10 @@ static int n_home_dir(lua_State *L) {
     if (!h) h = getenv("USERPROFILE");
     if (!h) h = "C:\\Users\\Default";
 #else
-    if (!h) h = "/root";
+    if (!h) {
+        struct passwd *pw = getpwuid(getuid());
+        h = pw ? pw->pw_dir : "/";
+    }
 #endif
     lua_pushstring(L, h);
     return 1;
@@ -563,11 +661,11 @@ static int n_current_platform(lua_State *L) {
     #endif
 #elif defined(__linux__)
     #if defined(__aarch64__)
-        lua_pushstring(L, "aarch64-pc-linux-gnu");
+        lua_pushstring(L, "aarch64-linux-gnu");
     #elif defined(__arm__)
-        lua_pushstring(L, "armv7l-pc-linux-gnueabihf");
+        lua_pushstring(L, "armv7l-linux-gnueabihf");
     #else
-        lua_pushstring(L, "x86_64-pc-linux-gnu");
+        lua_pushstring(L, "x86_64-linux-gnu");
     #endif
 #elif defined(__APPLE__)
     #if TARGET_OS_IPHONE
@@ -671,7 +769,8 @@ static int n_start_cmd(lua_State *L) {
 
 /* ── spkg.wait_task(task_id) → {ok, out, code} | nil (running) ─── */
 static int n_wait_task(lua_State *L) {
-    int slot = (int)luaL_checkinteger(L, 1) - 1;
+    lua_Integer val = luaL_checkinteger(L, 1);
+    int slot = val > (lua_Integer)INT_MAX ? -1 : (int)val - 1;
     if (slot < 0 || slot >= MAX_ASYNC_CMDS || !win_async_cmds[slot].in_use) {
         lua_pushnil(L);
         return 1;
@@ -695,15 +794,17 @@ static int n_wait_task(lua_State *L) {
     if (fp) {
         char buf[4096];
         out = malloc(1);
-        out[0] = '\0';
-        while (fgets(buf, sizeof(buf), fp)) {
-            size_t n = strlen(buf);
-            char *tmp = realloc(out, total + n + 1);
-            if (!tmp) { free(out); out = NULL; break; }
-            out = tmp;
-            memcpy(out + total, buf, n);
-            total += n;
-            out[total] = '\0';
+        if (out) {
+            out[0] = '\0';
+            while (fgets(buf, sizeof(buf), fp)) {
+                size_t n = strlen(buf);
+                char *tmp = realloc(out, total + n + 1);
+                if (!tmp) { free(out); out = NULL; break; }
+                out = tmp;
+                memcpy(out + total, buf, n);
+                total += n;
+                out[total] = '\0';
+            }
         }
         fclose(fp);
     }
@@ -715,7 +816,7 @@ static int n_wait_task(lua_State *L) {
     lua_newtable(L);
     lua_pushboolean(L, exit_code == 0); lua_setfield(L, -2, "ok");
     lua_pushstring(L, out ? out : "");  lua_setfield(L, -2, "out");
-    lua_pushinteger(L, (int)exit_code);  lua_setfield(L, -2, "code");
+    lua_pushinteger(L, (lua_Integer)exit_code);  lua_setfield(L, -2, "code");
 
     free(out);
     return 1;
@@ -746,7 +847,6 @@ static int n_start_cmd(lua_State *L) {
         return 2;
     }
 
-    /* Create temp file for output */
     char tmpfile[] = "/tmp/spkg_cmd_XXXXXX";
     int fd = mkstemp(tmpfile);
     if (fd < 0) {
@@ -754,26 +854,25 @@ static int n_start_cmd(lua_State *L) {
         lua_pushstring(L, strerror(errno));
         return 2;
     }
-    close(fd);
-
-    /* Build command: /bin/sh -c "cmd > tmpfile 2>&1" */
-    char full_cmd[4096];
-    snprintf(full_cmd, sizeof(full_cmd), "%s > '%s' 2>&1", cmd, tmpfile);
 
     pid_t pid = fork();
     if (pid < 0) {
+        close(fd);
         remove(tmpfile);
         lua_pushnil(L);
         lua_pushstring(L, strerror(errno));
         return 2;
     }
     if (pid == 0) {
-        /* Child */
-        execl("/bin/sh", "sh", "-c", full_cmd, (char *)NULL);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
 
-    /* Parent */
+    close(fd);
+
     posix_async_cmds[slot].pid = pid;
     posix_async_cmds[slot].in_use = 1;
     strncpy(posix_async_cmds[slot].out_file, tmpfile, sizeof(posix_async_cmds[slot].out_file) - 1);
@@ -784,7 +883,8 @@ static int n_start_cmd(lua_State *L) {
 
 /* ── spkg.wait_task(task_id) → {ok, out, code} | nil (running) ─── */
 static int n_wait_task(lua_State *L) {
-    int slot = (int)luaL_checkinteger(L, 1) - 1;
+    lua_Integer val = luaL_checkinteger(L, 1);
+    int slot = val > (lua_Integer)INT_MAX ? -1 : (int)val - 1;
     if (slot < 0 || slot >= MAX_ASYNC_CMDS || !posix_async_cmds[slot].in_use) {
         lua_pushnil(L);
         return 1;
@@ -811,15 +911,17 @@ static int n_wait_task(lua_State *L) {
     if (fp) {
         char buf[4096];
         out = malloc(1);
-        out[0] = '\0';
-        while (fgets(buf, sizeof(buf), fp)) {
-            size_t n = strlen(buf);
-            char *tmp = realloc(out, total + n + 1);
-            if (!tmp) { free(out); out = NULL; break; }
-            out = tmp;
-            memcpy(out + total, buf, n);
-            total += n;
-            out[total] = '\0';
+        if (out) {
+            out[0] = '\0';
+            while (fgets(buf, sizeof(buf), fp)) {
+                size_t n = strlen(buf);
+                char *tmp = realloc(out, total + n + 1);
+                if (!tmp) { free(out); out = NULL; break; }
+                out = tmp;
+                memcpy(out + total, buf, n);
+                total += n;
+                out[total] = '\0';
+            }
         }
         fclose(fp);
     }
@@ -858,14 +960,7 @@ static int n_remove(lua_State *L) {
     }
     lua_pushboolean(L, r == 0);
 #else
-    int r = remove(path);
-    if (r != 0) {
-        /* Try as directory */
-        char cmd[PATH_MAX + 32];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-        r = system(cmd);
-    }
-    lua_pushboolean(L, r == 0);
+    lua_pushboolean(L, remove_recursive(path) == 0);
 #endif
     return 1;
 }
@@ -945,7 +1040,8 @@ static char *build_http_post(const char *url, const char *body, size_t *out_len)
               "\r\n",
               uri, (int)hlen_safe, host.buf, body_len);
 
-    *out_len = hlen + body_len;
+    if (hlen < 0) return NULL;
+    *out_len = (size_t)hlen + body_len;
     char *req = (char *)malloc(*out_len + 1);
     if (!req) return NULL;
     memcpy(req, header, hlen);
@@ -1015,7 +1111,8 @@ static char *build_http_get(const char *url, size_t *out_len) {
               "\r\n",
               uri, (int)hlen_safe, host.buf);
 
-    *out_len = hlen;
+    if (hlen < 0) return NULL;
+    *out_len = (size_t)hlen;
     char *req = (char *)malloc(*out_len + 1);
     if (!req) return NULL;
     memcpy(req, header, hlen);
@@ -1177,7 +1274,10 @@ static const char *get_cache_dir(void) {
     if (!home) home = getenv("USERPROFILE");
     if (!home) home = "C:\\Users\\Default";
 #else
-    if (!home) home = "/root";
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : "/";
+    }
 #endif
 
     snprintf(g_cache_dir, sizeof(g_cache_dir), "%s/.spkg-cache", home);
@@ -1189,9 +1289,7 @@ static void ensure_cache_dir(void) {
 #ifdef _WIN32
     CreateDirectoryA(dir, NULL);
 #else
-    char cmd[1280];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", dir);
-    system(cmd);
+    mkdir_p_native(dir);
 #endif
 }
 
@@ -1307,11 +1405,7 @@ static int n_cache_put(lua_State *L) {
 #ifdef _WIN32
     CreateDirectoryA(cache_dir_path, NULL);
 #else
-    {
-        char cmd[PATH_MAX + 32];
-        int n = snprintf(cmd, sizeof(cmd), "mkdir -p '%s' 2>/dev/null", cache_dir_path);
-        if (n > 0 && (size_t)n < sizeof(cmd)) system(cmd);
-    }
+    mkdir_p_native(cache_dir_path);
 #endif
 
     /* Copy file_path → cache_dir/output.o */
@@ -1353,9 +1447,24 @@ static int n_cache_stats(lua_State *L) {
         pclose(cmd_fp);
     }
 #else
-    char cmd[PATH_MAX + 64];
+    /* Escape single-quotes in dir for safe shell use */
+    char safe_dir[PATH_MAX];
+    {
+        size_t di = 0;
+        for (const char *p = dir; *p && di < sizeof(safe_dir) - 5; p++) {
+            if (*p == '\'') {
+                safe_dir[di++] = '\''; safe_dir[di++] = '\\';
+                safe_dir[di++] = '\''; safe_dir[di++] = '\'';
+            } else {
+                safe_dir[di++] = *p;
+            }
+        }
+        safe_dir[di] = '\0';
+    }
+
+    char cmd[PATH_MAX + 128];
     snprintf(cmd, sizeof(cmd),
-        "ls -1d '%s'/*/ 2>/dev/null | wc -l", dir);
+        "ls -1d '%s'/*/ 2>/dev/null | wc -l", safe_dir);
     FILE *cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
         char line[64];
@@ -1366,7 +1475,7 @@ static int n_cache_stats(lua_State *L) {
     }
     /* Total size */
     snprintf(cmd, sizeof(cmd),
-        "du -sb '%s' 2>/dev/null | cut -f1", dir);
+        "du -sb '%s' 2>/dev/null | cut -f1", safe_dir);
     cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
         char line[64];
@@ -1394,9 +1503,7 @@ static int n_cache_clear(lua_State *L) {
     snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", dir);
     lua_pushboolean(L, system(cmd) == 0);
 #else
-    char cmd[PATH_MAX + 32];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-    lua_pushboolean(L, system(cmd) == 0);
+    lua_pushboolean(L, remove_recursive(dir) == 0);
 #endif
     return 1;
 }
@@ -1414,11 +1521,11 @@ static int n_custom_needs_run(lua_State *L) {
     /* First pass: find newest output mtime */
     if (!lua_istable(L, 2)) { lua_pushboolean(L, 1); return 1; }
 
-    int out_count = (int)lua_rawlen(L, 2);
+    lua_Unsigned out_count = lua_rawlen(L, 2);
     if (out_count == 0) { lua_pushboolean(L, 1); return 1; }
 
-    for (int i = 1; i <= out_count; i++) {
-        lua_rawgeti(L, 2, i);
+    for (lua_Unsigned i = 1; i <= out_count; i++) {
+        lua_rawgeti(L, 2, (lua_Integer)i);
         const char *opath = lua_tostring(L, -1);
         double mt = 0.0;
 #ifdef _WIN32
@@ -1446,9 +1553,9 @@ static int n_custom_needs_run(lua_State *L) {
 
     /* Second pass: check if any input is newer than newest output */
     if (lua_istable(L, 1)) {
-        int in_count = (int)lua_rawlen(L, 1);
-        for (int i = 1; i <= in_count; i++) {
-            lua_rawgeti(L, 1, i);
+        lua_Unsigned in_count = lua_rawlen(L, 1);
+        for (lua_Unsigned i = 1; i <= in_count; i++) {
+            lua_rawgeti(L, 1, (lua_Integer)i);
             const char *ipath = lua_tostring(L, -1);
             double mt = 0.0;
 #ifdef _WIN32
@@ -1491,9 +1598,9 @@ static int n_custom_exec(lua_State *L) {
     /* Build command string from argv table */
     char cmd[4096] = {0};
     size_t total = 0;
-    int argc = (int)lua_rawlen(L, 1);
-    for (int i = 1; i <= argc; i++) {
-        lua_rawgeti(L, 1, i);
+    lua_Unsigned argc = lua_rawlen(L, 1);
+    for (lua_Unsigned i = 1; i <= argc; i++) {
+        lua_rawgeti(L, 1, (lua_Integer)i);
         const char *arg = lua_tostring(L, -1);
         if (arg) {
             size_t n = strlen(arg);
@@ -1537,6 +1644,14 @@ static int n_custom_exec(lua_State *L) {
     char buf[4096];
     size_t out_total = 0;
     char *out = malloc(1);
+    if (!out) {
+        pclose(fp);
+        lua_newtable(L);
+        lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
+        lua_pushliteral(L, "out of memory"); lua_setfield(L, -2, "out");
+        lua_pushinteger(L, -1); lua_setfield(L, -2, "code");
+        return 1;
+    }
     out[0] = '\0';
 
     while (fgets(buf, sizeof(buf), fp)) {

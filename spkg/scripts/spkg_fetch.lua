@@ -102,14 +102,15 @@ local function clone_dep(resolved, pkg_dir)
     end
 
     local r = spkg.run_cmd(cmd)
+    if not r then return false end
     if not r.ok then
-        print("    error:\n" .. r.out)
+        print("    error:\n" .. (r.out or ""))
         return false
     end
 
-    local cmd = "cd '" .. pkg_dir .. "' && git rev-parse HEAD"
-    local r = spkg.run_cmd(cmd)
-    local commit = r.ok and r.out:gsub("%s+", "") or nil
+    cmd = "cd '" .. pkg_dir .. "' && git rev-parse HEAD"
+    r = spkg.run_cmd(cmd)
+    local commit = r and r.ok and r.out and r.out:gsub("%s+", "") or nil
     if commit and commit ~= "" then
         resolved.commit = commit
     else
@@ -273,10 +274,10 @@ function M.check_updates(deps)
                 print("  [check] " .. name .. " (locked: " .. locked.commit:sub(1, 8) .. ")")
                 local cmd = string.format('git clone --depth 1 "%s" "%s" 2>&1', resolved.url, tmpdir)
                 local r = spkg.run_cmd(cmd)
-                if r.ok then
+                if r and r.ok then
                     local cmd2 = "cd '" .. tmpdir .. "' && git rev-parse HEAD"
                     local r2 = spkg.run_cmd(cmd2)
-                    local remote_commit = r2.ok and r2.out:gsub("%s+", "") or nil
+                    local remote_commit = r2 and r2.ok and r2.out and r2.out:gsub("%s+", "") or nil
 
                     if remote_commit and remote_commit ~= locked.commit then
                         print("    available: " .. remote_commit:sub(1, 8) .. " (newer)")
@@ -288,7 +289,7 @@ function M.check_updates(deps)
 
                     spkg.remove(tmpdir)
                 else
-                    print("    [warn] failed to fetch remote: " .. (r.out:gsub("\n", " ")))
+                    print("    [warn] failed to fetch remote: " .. (r and r.out and r.out:gsub("\n", " ") or "unknown error"))
                 end
             end
         else

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <pwd.h>
 
 #include "lua.h"
 #include "lualib.h"
@@ -72,6 +73,7 @@ static int load_embedded(lua_State *L, const char *name,
 typedef struct {
     const char *cmd;
     const char *target;       /* --target <triple>       */
+    const char *sysroot;      /* --sysroot <path>        */
     const char *optimize;     /* --optimize <level>      */
     int         verbose;      /* --verbose               */
     int         all_targets;  /* --all                   */
@@ -90,6 +92,8 @@ static void parse_cli(int argc, char **argv, cli_args_t *out) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
             out->target = argv[++i];
+        } else if (strcmp(argv[i], "--sysroot") == 0 && i + 1 < argc) {
+            out->sysroot = argv[++i];
         } else if (strcmp(argv[i], "--optimize") == 0 && i + 1 < argc) {
             out->optimize = argv[++i];
         } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -103,12 +107,13 @@ static void parse_cli(int argc, char **argv, cli_args_t *out) {
         } else if (strcmp(argv[i], "--dist") == 0) {
             out->distributed = 1;
         } else if (argv[i][0] == '-' && strncmp(argv[i], "--", 2) == 0) {
-            out->extra_args[out->extra_count++] = argv[i];
+            if (out->extra_count < 64)
+                out->extra_args[out->extra_count++] = argv[i];
         } else if (argv[i][0] != '-') {
             if (!first_pos) {
                 out->cmd = argv[i];
                 first_pos = 1;
-            } else {
+            } else if (out->extra_count < 64) {
                 out->extra_args[out->extra_count++] = argv[i];
             }
         }
@@ -122,7 +127,10 @@ int main(int argc, char **argv) {
     parse_cli(argc, argv, &cli);
 
     const char *home = getenv("HOME");
-    if (!home) home = "/root";
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        home = pw ? pw->pw_dir : "/";
+    }
 
     /* Create Lua VM */
     lua_State *L = luaL_newstate();
@@ -152,6 +160,7 @@ int main(int argc, char **argv) {
     lua_pushstring(L, cli.cmd);
     lua_pushstring(L, home);
     lua_pushstring(L, cli.target   ? cli.target   : "");
+    lua_pushstring(L, cli.sysroot  ? cli.sysroot  : "");
     lua_pushstring(L, cli.optimize ? cli.optimize : "Debug");
     lua_pushboolean(L, cli.verbose);
     lua_pushboolean(L, cli.all_targets);
@@ -166,7 +175,7 @@ int main(int argc, char **argv) {
         lua_rawseti(L, -2, i + 1);
     }
 
-    int rc = lua_pcall(L, 10, 1, 0);
+    int rc = lua_pcall(L, 11, 1, 0);
     if (rc != LUA_OK) {
         fprintf(stderr, "spkg: %s\n", lua_tostring(L, -1));
         goto fail;

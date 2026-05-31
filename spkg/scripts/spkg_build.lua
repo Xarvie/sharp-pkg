@@ -50,15 +50,24 @@ end
 local function parse_target(triple)
     local arch, vendor, os, abi = triple:match("^([^-]+)-([^-]+)-([^-]+)-([^-]+)$")
     if not arch then
+        arch, vendor, os = triple:match("^([^-]+)-([^-]+)-([^-]+)$")
+    end
+    if not arch then
+        arch, os = triple:match("^([^-]+)-([^-]+)$")
+    end
+    if not arch then
+        if triple and triple ~= "" then
+            print(warn_msg("unexpected target triple format: '" .. triple .. "'"))
+        end
         local fallback = triple or ""
         return { raw = fallback, os = fallback, arch = fallback, vendor = "", abi = "" }
     end
     return {
         raw    = triple,
-        arch   = arch,
-        vendor = vendor,
-        os     = os,
-        abi    = abi,
+        arch   = arch or "",
+        vendor = vendor or "",
+        os     = os or "",
+        abi    = abi or "",
     }
 end
 
@@ -101,6 +110,10 @@ local function artifact_output(art)
     end
 end
 
+local function find_compiler()
+    return spkg.find_sharpc()
+end
+
 -- ═══════════════════════════════════════════════════════════════
 -- Build Context (the "b" object)
 -- ═══════════════════════════════════════════════════════════════
@@ -136,6 +149,13 @@ local function create_build_context()
         return spkg.current_platform()
     end
 
+    function ctx:get_sysroot()
+        if _SPKG_SYSROOT and _SPKG_SYSROOT ~= "" then
+            return _SPKG_SYSROOT
+        end
+        return nil
+    end
+
     local declared_options = {}
     local resolved_options = nil
 
@@ -156,6 +176,23 @@ local function create_build_context()
 
     ctx.target   = parse_target(ctx:get_target())
     ctx.host     = parse_target(ctx:get_host())
+
+    function ctx:platform()
+        local t = ctx:get_target()
+        local h = spkg.current_platform()
+        local parsed = parse_target(t)
+        return {
+            raw       = t,
+            is_host   = (t == "" or t == h),
+            is_android = function() return t:match("android") ~= nil end,
+            is_ios     = function() return t:match("ios")     ~= nil end,
+            is_macos   = function() return t:match("darwin")  ~= nil or t:match("macos") ~= nil end,
+            is_linux   = function() return t:match("linux")   ~= nil end,
+            is_windows = function() return t:match("windows") ~= nil or t:match("mingw") ~= nil end,
+            arch       = parsed.arch,
+            os         = parsed.os,
+        }
+    end
     ctx.options  = setmetatable({}, {
         __index = function(_, k)
             return ctx:_resolve_options()[k]
@@ -319,6 +356,62 @@ local function create_build_context()
         return art
     end
 
+    local _include_cache = {}
+
+    function ctx:has_include(header)
+        local target = ctx:get_target()
+        local key = target .. "|" .. header
+        if _include_cache[key] ~= nil then
+            return _include_cache[key]
+        end
+
+        local compiler = find_compiler()
+        if not compiler then
+            _include_cache[key] = false
+            return false
+        end
+
+        local target_flat = target:gsub("[/\\%.]", "_")
+        local tmpfile = ".spkg_check_" .. target_flat .. "_" .. header:gsub("[/\\%.]", "_") .. ".c"
+        spkg.write_file(tmpfile, "#include <" .. header .. ">\nint __spkg_check(void){return 0;}\n")
+
+        local tflag = ""
+        if _SPKG_TARGET and _SPKG_TARGET ~= "" then
+            tflag = " --target " .. _SPKG_TARGET
+        end
+        local cmd = compiler .. tflag .. " -c " .. tmpfile .. " -o /dev/null"
+        local r = spkg.run_cmd(cmd)
+
+        if spkg.file_exists(tmpfile) then
+            spkg.remove(tmpfile)
+        end
+
+        _include_cache[key] = r.ok
+        return r.ok
+    end
+
+    function ctx:has_libc()
+        return ctx:has_include("stdlib.h") and ctx:has_include("stdio.h")
+    end
+
+    function ctx:has_cflag(pattern)
+        local env = os.getenv("CFLAGS") or ""
+        if env:find(pattern, 1, true) then
+            return true
+        end
+        local spkg_env = os.getenv("SPKG_CFLAGS") or ""
+        if spkg_env:find(pattern, 1, true) then
+            return true
+        end
+        return false
+    end
+
+    function ctx:is_freestanding()
+        return ctx:has_cflag("-ffreestanding")
+            or ctx:has_cflag("-nostdlib")
+            or ctx:has_cflag("-nodefaultlibs")
+    end
+
     return ctx
 end
 
@@ -355,7 +448,8 @@ local function topo_sort(artifacts)
 
     -- in_degree[X] = number of artifacts that X depends on (within our list)
     for _, art in ipairs(artifacts) do
-        for _, dep_name in ipairs(art.link_deps) do
+        for _, dep_entry in ipairs(art.link_deps) do
+            local dep_name = dep_entry.name
             if by_name[dep_name] then
                 in_degree[art.name] = in_degree[art.name] + 1
                 table.insert(reverse_deps[dep_name], art.name)
@@ -445,6 +539,11 @@ end
 
 function M.build_graph_from_ctx(ctx, include_tests)
     local target = ctx:get_target()
+    local host = ctx:get_host()
+    local cross_target = nil
+    if _SPKG_TARGET and _SPKG_TARGET ~= "" then
+        cross_target = _SPKG_TARGET
+    end
 
     build_graph = {
         target   = target,
@@ -453,6 +552,9 @@ function M.build_graph_from_ctx(ctx, include_tests)
     }
 
     local opt_flag = ctx._optimize_flags[ctx:get_optimize()] or "-O0"
+    local sysroot_flag = nil
+    local sysroot = ctx:get_sysroot()
+    if sysroot then sysroot_flag = "--sysroot=" .. sysroot end
 
     -- Build combined list: install_list + tests (if requested)
     local all_artifacts = {}
@@ -468,7 +570,7 @@ function M.build_graph_from_ctx(ctx, include_tests)
         local artifact_graph = {
             name             = art.name,
             type             = art.type,
-            target           = target,
+            target           = cross_target or host,
             compile_tasks    = {},
             link_step        = {},
             run_args         = art.run_args or {},
@@ -495,6 +597,9 @@ function M.build_graph_from_ctx(ctx, include_tests)
             for _, f in ipairs(art.cflags) do
                 table.insert(src_cflags, f)
             end
+            if sysroot_flag then
+                table.insert(src_cflags, sysroot_flag)
+            end
 
             for _, fp in ipairs(files) do
                 local stem = fp:gsub("%.ce$", ""):gsub("[/\\]", "_")
@@ -503,6 +608,7 @@ function M.build_graph_from_ctx(ctx, include_tests)
                     source = fp,
                     output = output,
                     cflags = src_cflags,
+                    target = cross_target or "",
                 })
             end
         end
@@ -652,22 +758,26 @@ end
 -- Compiler / Linker Execution
 -- ═══════════════════════════════════════════════════════════════
 
-local function find_compiler()
-    local sharpc = spkg.find_sharpc()
-    if sharpc then return sharpc end
-    local zig = spkg.find_zigcc()
-    if zig then return zig end
-    return nil
-end
-
 local function compile_task_cmd(task, verbose)
     local compiler = find_compiler()
     if not compiler then return nil end
 
     local depfile = task.output:gsub("%.o$", ".d")
     local cflags_str = table.concat(task.cflags, " ")
-    return string.format('%s -c %s -MMD -MF "%s" "%s" -o "%s"',
-        compiler, cflags_str, depfile, task.source, task.output)
+    local target_flag = ""
+    if task.target and task.target ~= "" then
+        target_flag = " --target " .. task.target
+    end
+    local sysroot_flag = ""
+    if _SPKG_SYSROOT and _SPKG_SYSROOT ~= "" then
+        sysroot_flag = " --sysroot " .. _SPKG_SYSROOT
+    end
+    local opt_flag = ""
+    if _SPKG_OPTIMIZE and _SPKG_OPTIMIZE ~= "" then
+        opt_flag = " --optimize " .. _SPKG_OPTIMIZE
+    end
+    return string.format('%s%s%s%s -c %s -MMD -MF "%s" "%s" -o "%s"',
+        compiler, target_flag, sysroot_flag, opt_flag, cflags_str, depfile, task.source, task.output)
 end
 
 local function compile_task(task, verbose)
@@ -675,6 +785,7 @@ local function compile_task(task, verbose)
     if not _SPKG_NO_CACHE then
         spkg.cache_init()
         local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                          (task.target or "") .. "_" ..
                           file_content_fingerprint(task.source)
         if spkg.cache_get(cache_key, task.output) then
             if verbose then print("  [cache hit] " .. task.source) end
@@ -693,14 +804,16 @@ local function compile_task(task, verbose)
     if verbose then print("  " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
+    if not r then return false end
     if not r.ok then
-        print(error_msg("compilation failed:\n" .. r.out))
+        print(error_msg("compilation failed:\n" .. (r.out or "")))
         return false
     end
 
     -- Save to cache (unless --no-cache)
     if not _SPKG_NO_CACHE then
         local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                          (task.target or "") .. "_" ..
                           file_content_fingerprint(task.source)
         spkg.cache_put(cache_key, task.output)
     end
@@ -708,7 +821,7 @@ local function compile_task(task, verbose)
     -- Save fingerprint on success
     save_fingerprint(task.output, task.cflags)
 
-    if verbose and r.out ~= "" then print("    " .. r.out) end
+    if verbose and r.out and r.out ~= "" then print("    " .. r.out) end
     return true
 end
 
@@ -749,8 +862,9 @@ local function link_artifact(artifact, verbose)
         if verbose then print("    " .. cmd) end
 
         local r = spkg.run_cmd(cmd)
+        if not r then return false end
         if not r.ok then
-            print("    ar error:\n" .. r.out)
+            print("    ar error:\n" .. (r.out or ""))
             return false
         end
         return true
@@ -761,6 +875,19 @@ local function link_artifact(artifact, verbose)
     if not compiler then
         print("spkg: no linker found.")
         return false
+    end
+
+    local tflag = ""
+    if artifact.target and artifact.target ~= "" then
+        tflag = " --target " .. artifact.target
+    end
+    local sysroot_flag = ""
+    if _SPKG_SYSROOT and _SPKG_SYSROOT ~= "" then
+        sysroot_flag = " --sysroot " .. _SPKG_SYSROOT
+    end
+    local opt_flag = ""
+    if _SPKG_OPTIMIZE and _SPKG_OPTIMIZE ~= "" then
+        opt_flag = " --optimize " .. _SPKG_OPTIMIZE
     end
 
     if verbose then
@@ -776,14 +903,15 @@ local function link_artifact(artifact, verbose)
     end
     local inputs = table.concat(inputs_list, " ")
     local ldflags = table.concat(link.ldflags, " ")
-    local cmd = string.format('%s %s %s -o "%s"',
-        compiler, inputs, ldflags, link.output)
+    local cmd = string.format('%s%s%s%s %s %s -o "%s"',
+        compiler, tflag, sysroot_flag, opt_flag, inputs, ldflags, link.output)
 
     if verbose then print("    " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
+    if not r then return false end
     if not r.ok then
-        print("    link error:\n" .. r.out)
+        print("    link error:\n" .. (r.out or ""))
         return false
     end
 
@@ -808,6 +936,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
         if not _SPKG_NO_CACHE then
             spkg.cache_init()
             local cache_key = compute_fingerprint(task.cflags) .. "_" ..
+                              (task.target or "") .. "_" ..
                               file_content_fingerprint(task.source)
             if spkg.cache_get(cache_key, task.output) then
                 if verbose then print("  [cache hit] " .. task.source) end
@@ -862,6 +991,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                     save_fingerprint(r.item.task.output, r.item.task.cflags)
                     if not _SPKG_NO_CACHE then
                         local cache_key = compute_fingerprint(r.item.task.cflags) .. "_" ..
+                                          (r.item.task.target or "") .. "_" ..
                                           file_content_fingerprint(r.item.task.source)
                         spkg.cache_put(cache_key, r.item.task.output)
                     end
@@ -1208,11 +1338,12 @@ local function execute_custom_steps(steps, verbose)
                 print("  [custom] " .. step.name)
             end
             local r = spkg.custom_exec(step.command, nil)
+            if not r then return false end
             if not r.ok then
-                print("    error:\n" .. r.out)
+                print("    error:\n" .. (r.out or ""))
                 return false
             end
-            if verbose and r.out ~= "" then print("    " .. r.out) end
+            if verbose and r.out and r.out ~= "" then print("    " .. r.out) end
         end
     end
     return true
@@ -1353,6 +1484,7 @@ function M.run_first_artifact(extra_args)
 
             if _SPKG_VERBOSE then print("  [run] " .. cmd) end
             local r = spkg.run_cmd(cmd)
+            if not r then return false end
             if r.out ~= "" then print(r.out) end
             return r.ok
         end
@@ -1426,9 +1558,10 @@ function M.execute_tests(verbose)
         print(COLOR("  [test] " .. art.name, "bold_cyan"))
 
         local r = spkg.run_cmd(cmd)
+        if not r then return false end
         if r.out ~= "" then print(r.out) end
         if not r.ok then
-            print(error_msg("test " .. art.name .. " failed (exit code " .. r.code .. ")"))
+            print(error_msg("test " .. art.name .. " failed (exit code " .. tostring(r.code) .. ")"))
             return false
         end
         print(COLOR("  [pass] " .. art.name, "bold_green"))

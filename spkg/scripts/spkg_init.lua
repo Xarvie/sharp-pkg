@@ -16,9 +16,10 @@ local function load_deps_from_config()
     return ctx._deps or {}
 end
 
-spkg_main = function(cmd, home, target, optimize, verbose, all_targets, jobs, no_cache, dist, args)
+spkg_main = function(cmd, home, target, sysroot, optimize, verbose, all_targets, jobs, no_cache, dist, args)
 
     _SPKG_TARGET   = target
+    _SPKG_SYSROOT  = sysroot
     _SPKG_OPTIMIZE = optimize
     _SPKG_VERBOSE  = verbose
     _SPKG_ALL      = all_targets
@@ -35,6 +36,7 @@ spkg — Sharp Package Manager
   spkg init                       create config.spkg
   spkg build                      build current target
   spkg build --target <triple>    cross-compile
+  spkg build --sysroot <path>    cross-compile sysroot
   spkg build --optimize <level>   Debug | ReleaseSafe | ReleaseFast | ReleaseSmall
   spkg build --verbose            detailed output
   spkg build --all                build all targets
@@ -271,7 +273,7 @@ function spkg_cmd_cache(args)
     end
 
     if args[1] == "--stats" then
-        local stats = spkg.cache_stats()
+        local stats = spkg.cache_stats() or {}
         print(string.format("Cache statistics:"))
         print(string.format("  entries:  %d", stats.count or 0))
         print(string.format("  hits:     %d", stats.hit or 0))

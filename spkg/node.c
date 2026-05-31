@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/select.h>
+#include <time.h>
 #include <errno.h>
 #include <dirent.h>
 
@@ -27,16 +30,6 @@
 #define PATH_SEP '/'
 #define PATH_SEP_STR "/"
 #endif
-
-static const char *find_path_sep(const char *p) {
-    for (; *p; p++) {
-        if (*p == PATH_SEP) return p;
-#ifdef _WIN32
-        if (*p == '/') return p;
-#endif
-    }
-    return NULL;
-}
 
 static int is_executable(const char *path) {
     FILE *f = fopen(path, "r");
@@ -57,7 +50,7 @@ static int resolve_self_exe(char *buf, size_t sz) {
     ssize_t n = readlink("/proc/self/exe", buf, sz - 1);
     if (n > 0) { buf[n] = '\0'; return 1; }
 #elif defined(__APPLE__)
-    uint32_t n = (uint32_t)sz;
+    uint32_t n = sz > UINT32_MAX ? UINT32_MAX : (uint32_t)sz;
     if (_NSGetExecutablePath(buf, &n) == 0) return 1;
 #elif defined(_WIN32)
     if (GetModuleFileNameA(NULL, buf, (DWORD)sz) > 0) return 1;
@@ -122,13 +115,7 @@ static const char *g_sharpc     = "sharpc";
 static int         g_max_jobs   = 4;
 static volatile int g_running   = 1;
 static volatile int g_active    = 0;
-static volatile int g_compile_timed_out = 0;
 #define COMPILE_TIMEOUT_SEC 120
-
-static void timeout_handler(int sig) {
-    (void)sig;
-    g_compile_timed_out = 1;
-}
 
 /* ── Minimal JSON extraction helpers ────────────────────────────── */
 
@@ -333,43 +320,101 @@ static int compile_task(const char *source_content, const char *cflags_str,
              depfile, src_path, out_path);
 
     /* Capture output with timeout */
-    signal(SIGALRM, timeout_handler);
-    alarm(COMPILE_TIMEOUT_SEC);
-    FILE *pfp = popen(cmd, "r");
+    int pipe_fd[2];
+    if (pipe(pipe_fd) != 0) {
+        if (error_out && error_buf_size > 0)
+            snprintf(error_out, error_buf_size, "pipe failed: %s", strerror(errno));
+        remove(src_path);
+        return -1;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fd[0]); close(pipe_fd[1]);
+        if (error_out && error_buf_size > 0)
+            snprintf(error_out, error_buf_size, "fork failed: %s", strerror(errno));
+        remove(src_path);
+        return -1;
+    }
+
     int ret = -1;
-    if (pfp) {
-        if (error_out && error_buf_size > 0) {
-            size_t n = fread(error_out, 1, error_buf_size - 1, pfp);
-            error_out[n] = '\0';
-            /* Trim trailing whitespace */
-            while (n > 0 && (error_out[n-1] == '\n' || error_out[n-1] == '\r' || error_out[n-1] == ' ')) {
-                error_out[--n] = '\0';
+    if (child == 0) {
+        close(pipe_fd[0]);
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+        close(pipe_fd[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipe_fd[1]);
+
+    char err_buf[4096];
+    size_t err_total = 0;
+    time_t start = time(NULL);
+
+    while (1) {
+        int status;
+        pid_t w = waitpid(child, &status, WNOHANG);
+        if (w < 0) break;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pipe_fd[0], &rfds);
+        struct timeval tv = { 0, 100000 };  /* 100ms */
+
+        if (select(pipe_fd[0] + 1, &rfds, NULL, NULL, &tv) > 0) {
+            char tmp[4096];
+            ssize_t nr = read(pipe_fd[0], tmp, sizeof(tmp));
+            if (nr > 0 && error_out && error_buf_size > 0) {
+                size_t space = error_buf_size - 1 - err_total;
+                if ((size_t)nr < space) {
+                    memcpy(err_buf + err_total, tmp, (size_t)nr);
+                    err_total += (size_t)nr;
+                    err_buf[err_total] = '\0';
+                }
             }
         }
-        int status = pclose(pfp);
-        alarm(0);
-        signal(SIGALRM, SIG_DFL);
-        if (g_compile_timed_out) {
-            g_compile_timed_out = 0;
-            if (error_out && error_buf_size > 0) {
-                snprintf(error_out, error_buf_size, "compilation timed out after %d seconds", COMPILE_TIMEOUT_SEC);
-            }
-        }
+
+        if (w > 0) {
 #ifdef _WIN32
-        ret = (status == 0) ? 0 : -1;
+            ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 #else
-        ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+            ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 #endif
-    } else {
-        alarm(0);
-        signal(SIGALRM, SIG_DFL);
-        if (g_compile_timed_out) {
-            g_compile_timed_out = 0;
+            break;
+        }
+
+        if (time(NULL) - start >= COMPILE_TIMEOUT_SEC) {
+            kill(child, SIGKILL);
+            waitpid(child, &status, 0);
             if (error_out && error_buf_size > 0) {
                 snprintf(error_out, error_buf_size, "compilation timed out after %d seconds", COMPILE_TIMEOUT_SEC);
             }
-        } else if (error_out && error_buf_size > 0) {
-            snprintf(error_out, error_buf_size, "popen failed: %s", strerror(errno));
+            break;
+        }
+    }
+
+    /* Drain remaining pipe data */
+    {
+        char tmp[4096];
+        ssize_t nr;
+        while ((nr = read(pipe_fd[0], tmp, sizeof(tmp))) > 0) {
+            if (error_out && error_buf_size > 0 &&
+                err_total + (size_t)nr < error_buf_size - 1) {
+                memcpy(err_buf + err_total, tmp, (size_t)nr);
+                err_total += (size_t)nr;
+                err_buf[err_total] = '\0';
+            }
+        }
+    }
+    close(pipe_fd[0]);
+
+    if (error_out && error_buf_size > 0 && err_total > 0) {
+        memcpy(error_out, err_buf, err_total);
+        error_out[err_total] = '\0';
+        while (err_total > 0 && (error_out[err_total-1] == '\n' || error_out[err_total-1] == '\r' || error_out[err_total-1] == ' ')) {
+            error_out[--err_total] = '\0';
         }
     }
 
@@ -521,6 +566,13 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         }
         fseek(fp, 0, SEEK_END);
         long osize = ftell(fp);
+        if (osize < 0) {
+            fclose(fp); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":2,"
+                      "\"stderr\":\"cannot read output .o size\"}");
+            goto cleanup;
+        }
         fseek(fp, 0, SEEK_SET);
 
         char *odata = (char *)malloc(osize);
@@ -637,10 +689,11 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
             g_listen = argv[++i];
         } else if (strcmp(argv[i], "--max-jobs") == 0 && i + 1 < argc) {
-            int val = atoi(argv[++i]);
-            if (val <= 0) val = 1;
+            char *end = NULL;
+            long val = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || val <= 0) val = 1;
             if (val > 64) val = 64;
-            g_max_jobs = val;
+            g_max_jobs = (int)val;
         } else if (strcmp(argv[i], "--sharpc") == 0 && i + 1 < argc) {
             g_sharpc = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
