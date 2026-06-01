@@ -698,20 +698,128 @@ end
 -- Fingerprint (detect cflag/include changes)
 -- ═══════════════════════════════════════════════════════════════
 
-local BUILD_SYSTEM_VERSION = "spkg-v4"
+local BUILD_SYSTEM_FP = nil
 
 local function compute_fingerprint(cflags)
+    if not BUILD_SYSTEM_FP then
+        BUILD_SYSTEM_FP = spkg.self_fingerprint()
+    end
     local sorted = {}
     for _, f in ipairs(cflags) do table.insert(sorted, f) end
     table.sort(sorted)
-    local raw = BUILD_SYSTEM_VERSION .. "|" .. table.concat(sorted, "|")
+    local raw = BUILD_SYSTEM_FP .. "|" .. table.concat(sorted, "|")
     return spkg.fingerprint(raw)
+end
+
+local _compiler_fp = nil
+local function compiler_fingerprint()
+    if _compiler_fp then return _compiler_fp end
+    local compiler = find_compiler()
+    if not compiler then
+        _compiler_fp = "no-compiler"
+        return _compiler_fp
+    end
+    local content = spkg.read_file(compiler)
+    if content then
+        _compiler_fp = spkg.fingerprint(content)
+    else
+        _compiler_fp = spkg.fingerprint(compiler)
+    end
+    return _compiler_fp
+end
+
+local _header_ctx_cache = {}
+
+-- Extract all include-relevant flags from cflags
+local function extract_all_includes(cflags)
+    local dirs = {}
+    for _, flag in ipairs(cflags) do
+        local dir = flag:match("^-I(.+)$")
+                 or flag:match("^-isystem%s+(.+)$")
+                 or flag:match("^-idirafter%s+(.+)$")
+                 or flag:match("^-iquote%s+(.+)$")
+        if dir and dir ~= "" then table.insert(dirs, dir) end
+    end
+    return dirs
+end
+
+local function header_context_fingerprint(task)
+    local cache_key = task.source .. "|" .. table.concat(task.cflags or {}, ",")
+    if _header_ctx_cache[cache_key] then
+        return _header_ctx_cache[cache_key]
+    end
+
+    local source = spkg.read_file(task.source)
+    if not source then
+        _header_ctx_cache[cache_key] = ""
+        return ""
+    end
+
+    local include_dirs = extract_all_includes(task.cflags or {})
+    local source_dir = task.source:match("(.*/)") or "."
+    local scanned = {}
+    local fps = {}
+
+    local function collect(source_content, depth)
+        if depth > 10 then return end
+        for line in source_content:gmatch("[^\n]*") do
+            local inc = line:match('#%s*include%s+"([^"]+)"')
+                     or line:match('#%s*include%s+<([^>]+)>')
+            if inc and not scanned[inc] then
+                scanned[inc] = true
+                local found = false
+                for _, dir in ipairs(include_dirs) do
+                    local full = dir .. "/" .. inc
+                    if spkg.file_exists(full) then
+                        local hc = spkg.read_file(full)
+                        if hc then
+                            table.insert(fps, spkg.fingerprint(hc))
+                            collect(hc, depth + 1)
+                        end
+                        found = true
+                        break
+                    end
+                end
+                if not found then
+                    local full = source_dir .. "/" .. inc
+                    if spkg.file_exists(full) then
+                        local hc = spkg.read_file(full)
+                        if hc then
+                            table.insert(fps, spkg.fingerprint(hc))
+                            collect(hc, depth + 1)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    collect(source, 0)
+    table.sort(fps)
+    local result = #fps > 0 and spkg.fingerprint(table.concat(fps, "|")) or ""
+    _header_ctx_cache[cache_key] = result
+    return result
+end
+
+local function file_content_fingerprint(filepath)
+    local content = spkg.read_file(filepath)
+    if content then
+        return spkg.fingerprint(content)
+    end
+    return spkg.fingerprint(filepath)
+end
+
+local function cache_key_for(task)
+    return compute_fingerprint(task.cflags) .. "_" ..
+           (task.target or "") .. "_" ..
+           file_content_fingerprint(task.source) .. "_" ..
+           compiler_fingerprint() .. "_" ..
+           header_context_fingerprint(task)
 end
 
 local function needs_compile(source, output, cflags)
     local src_mtime = spkg.get_mtime(source)
     if not src_mtime then
-        -- Source was deleted; clean up artifacts
         if spkg.file_exists(output) then spkg.remove(output) end
         local depfile = output:gsub("%.o$", ".d")
         if spkg.file_exists(depfile) then spkg.remove(depfile) end
@@ -721,7 +829,6 @@ local function needs_compile(source, output, cflags)
     local out_mtime = spkg.get_mtime(output)
     if not out_mtime then return true end
 
-    -- Check .d file for header dependencies
     local depfile = output:gsub("%.o$", ".d")
     local headers = parse_depfile(depfile)
     for _, h in ipairs(headers) do
@@ -729,14 +836,13 @@ local function needs_compile(source, output, cflags)
         if h_mtime and h_mtime > out_mtime then return true end
     end
 
-    -- Check command fingerprint
     local fp_file = output .. ".fp"
     local new_fp = compute_fingerprint(cflags or {})
     if spkg.file_exists(fp_file) then
         local old_fp = spkg.read_file(fp_file)
         if old_fp ~= new_fp then return true end
     else
-        return true  -- no fingerprint file = first compile
+        return true
     end
 
     return src_mtime > out_mtime
@@ -746,14 +852,6 @@ local function save_fingerprint(output, cflags)
     local fp_file = output .. ".fp"
     local fp = compute_fingerprint(cflags or {})
     spkg.write_file(fp_file, fp)
-end
-
-local function file_content_fingerprint(filepath)
-    local content = spkg.read_file(filepath)
-    if content then
-        return spkg.fingerprint(content)
-    end
-    return spkg.fingerprint(filepath)
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -786,9 +884,7 @@ local function compile_task(task, verbose)
     -- Check cache first (unless --no-cache)
     if not _SPKG_NO_CACHE then
         spkg.cache_init()
-        local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                          (task.target or "") .. "_" ..
-                          file_content_fingerprint(task.source)
+        local cache_key = cache_key_for(task)
         if spkg.cache_get(cache_key, task.output) then
             if verbose then print("  [cache hit] " .. task.source) end
             save_fingerprint(task.output, task.cflags)
@@ -814,10 +910,7 @@ local function compile_task(task, verbose)
 
     -- Save to cache (unless --no-cache)
     if not _SPKG_NO_CACHE then
-        local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                          (task.target or "") .. "_" ..
-                          file_content_fingerprint(task.source)
-        spkg.cache_put(cache_key, task.output)
+        spkg.cache_put(cache_key_for(task), task.output)
     end
 
     -- Save fingerprint on success
@@ -937,13 +1030,10 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
     for _, task in ipairs(tasks) do
         if not _SPKG_NO_CACHE then
             spkg.cache_init()
-            local cache_key = compute_fingerprint(task.cflags) .. "_" ..
-                              (task.target or "") .. "_" ..
-                              file_content_fingerprint(task.source)
+            local cache_key = cache_key_for(task)
             if spkg.cache_get(cache_key, task.output) then
                 if verbose then print("  [cache hit] " .. task.source) end
                 save_fingerprint(task.output, task.cflags)
-                -- skip, already cached
             else
                 table.insert(pending, { task = task })
             end
@@ -982,6 +1072,11 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                 local result = spkg.wait_task(r.id)
                 if not result then
                     table.insert(still_running, r)
+                else
+                    if result.ok then
+                        save_fingerprint(r.item.task.output, r.item.task.cflags)
+                        spkg.cache_put(cache_key_for(r.item.task), r.item.task.output)
+                    end
                 end
             end
             running = still_running
@@ -1007,10 +1102,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                 if result.ok then
                     save_fingerprint(r.item.task.output, r.item.task.cflags)
                     if not _SPKG_NO_CACHE then
-                        local cache_key = compute_fingerprint(r.item.task.cflags) .. "_" ..
-                                          (r.item.task.target or "") .. "_" ..
-                                          file_content_fingerprint(r.item.task.source)
-                        spkg.cache_put(cache_key, r.item.task.output)
+                        spkg.cache_put(cache_key_for(r.item.task), r.item.task.output)
                     end
                 end
             else
@@ -1089,20 +1181,6 @@ end
 -- ═══════════════════════════════════════════════════════════════
 
 local CPP_EXTS = { cpp = true, cxx = true, cc = true, ["c++"] = true, m = true, mm = true }
-
--- Extract all include-relevant flags from cflags:
---   -I <dir>, -isystem <dir>, -idirafter <dir>, -iquote <dir>
-local function extract_all_includes(cflags)
-    local dirs = {}
-    for _, flag in ipairs(cflags) do
-        local dir = flag:match("^-I(.+)$")
-                 or flag:match("^-isystem%s+(.+)$")
-                 or flag:match("^-idirafter%s+(.+)$")
-                 or flag:match("^-iquote%s+(.+)$")
-        if dir and dir ~= "" then table.insert(dirs, dir) end
-    end
-    return dirs
-end
 
 -- Check if a path is a system header (should NOT be bundled to nodes)
 local function is_system_header(path)

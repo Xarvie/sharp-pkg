@@ -211,7 +211,7 @@ function spkg_cmd_add(args)
         return false
     end
 
-    local dep_line = string.format('b:dep("%s", { version = "%s" })', name, version)
+    local dep_line = 'b:dep("' .. name .. '", { version = "' .. version .. '" })'
     spkg.write_file("config.spkg", content .. "\n" .. dep_line .. "\n")
     print("spkg: added dependency '" .. name .. "' (" .. version .. ")")
     return true

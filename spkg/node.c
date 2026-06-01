@@ -678,6 +678,12 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
         /* fall through */
 
 cleanup:
+        if (rc != 0 && out_path[0]) {
+            char depfile[520];
+            remove(out_path);
+            snprintf(depfile, sizeof(depfile), "%s.d", out_path);
+            remove(depfile);
+        }
         if (hdr_dir) {
             remove_dir(hdr_dir);
             free(hdr_dir);
@@ -726,8 +732,13 @@ int main(int argc, char *argv[]) {
     }
 
     /* Register signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif

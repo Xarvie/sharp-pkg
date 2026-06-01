@@ -83,8 +83,11 @@ end
 
 local function clone_dep(resolved, pkg_dir)
     if spkg.dir_exists(pkg_dir) then
-        print("  [cached] " .. (resolved.name or "unknown"))
-        return true
+        if spkg.dir_exists(pkg_dir .. "/.git") then
+            print("  [cached] " .. (resolved.name or "unknown"))
+            return true
+        end
+        spkg.remove(pkg_dir)
     end
 
     if not resolved or not resolved.url then
@@ -289,11 +292,11 @@ function M.check_updates(deps)
                     else
                         print("    up to date")
                     end
-
-                    spkg.remove(tmpdir)
                 else
                     print("    [warn] failed to fetch remote: " .. (r and r.out and r.out:gsub("\n", " ") or "unknown error"))
                 end
+
+                if spkg.dir_exists(tmpdir) then spkg.remove(tmpdir) end
             end
         else
             print("  [check] " .. name .. " (not locked, will be fetched)")
@@ -326,19 +329,33 @@ function M.update_deps(home, deps)
         local old_commit = lock[name] and lock[name].commit or nil
 
         if dep.remote_commit and old_commit ~= dep.remote_commit then
-            if spkg.dir_exists(pkg_dir) then
-                spkg.remove(pkg_dir)
-                print("  [update] " .. name .. " " .. (old_commit and old_commit:sub(1, 8) or "?") .. " -> " .. dep.remote_commit:sub(1, 8))
+            local tmp_dir = "spkg_packages/.tmp_update_" .. name
+            if spkg.dir_exists(tmp_dir) then spkg.remove(tmp_dir) end
+
+            local resolved = resolve_dep(dep, home or _SPKG_HOME)
+            if not clone_dep(resolved, tmp_dir) then
+                spkg.remove(tmp_dir)
+                print("spkg: failed to update '" .. name .. "'")
+                return false
             end
+            if spkg.dir_exists(pkg_dir) then spkg.remove(pkg_dir) end
+            spkg.run_cmd("mv '" .. shell_escape_path(tmp_dir) .. "' '" .. shell_escape_path(pkg_dir) .. "'")
+            print("  [update] " .. name .. " " .. (old_commit and old_commit:sub(1, 8) or "?") .. " -> " .. dep.remote_commit:sub(1, 8))
+            table.insert(updated, {
+                name = resolved.name,
+                url = resolved.url,
+                version = resolved.version,
+                tag = resolved.tag,
+                commit = resolved.commit,
+            })
+        else
+            local resolved = resolve_dep(dep, home or _SPKG_HOME)
+            if not clone_dep(resolved, pkg_dir) then
+                print("spkg: failed to fetch '" .. name .. "'")
+                return false
+            end
+            table.insert(updated, resolved)
         end
-
-        local resolved = resolve_dep(dep, home or _SPKG_HOME)
-        if not clone_dep(resolved, pkg_dir) then
-            print("spkg: failed to update '" .. name .. "'")
-            return false
-        end
-
-        table.insert(updated, resolved)
     end
 
     spkg_lock.save(updated)

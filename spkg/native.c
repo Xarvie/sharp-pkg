@@ -718,6 +718,50 @@ static int n_current_platform(lua_State *L) {
     return 1;
 }
 
+/* ── spkg.self_fingerprint ───────────────────────────────────────── */
+static int n_self_fingerprint(lua_State *L) {
+    static char cached[17] = {0};
+    if (cached[0]) {
+        lua_pushstring(L, cached);
+        return 1;
+    }
+
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    int hashed = 0;
+
+#ifdef __linux__
+    {
+        FILE *fp = fopen("/proc/self/exe", "rb");
+        if (fp) {
+            unsigned char buf[8192];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+                for (size_t i = 0; i < n; i++) {
+                    hash ^= (uint64_t)buf[i];
+                    hash *= 0x100000001b3ULL;
+                }
+            }
+            if (ferror(fp)) hash = 0xcbf29ce484222325ULL;
+            fclose(fp);
+            hashed = 1;
+        }
+    }
+#endif
+
+    if (!hashed) {
+        /* Fallback: hash a fixed token — still better than no fingerprint */
+        const char *fallback = "spkg-self";
+        for (; *fallback; fallback++) {
+            hash ^= (uint64_t)(unsigned char)*fallback;
+            hash *= 0x100000001b3ULL;
+        }
+    }
+
+    snprintf(cached, sizeof(cached), "%016llx", (unsigned long long)hash);
+    lua_pushstring(L, cached);
+    return 1;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Async command execution — cross-platform (POSIX + Windows)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -805,6 +849,13 @@ static int n_wait_task(lua_State *L) {
     DWORD wait = WaitForSingleObject(win_async_cmds[slot].hProcess, 0);
     if (wait == WAIT_TIMEOUT) {
         lua_pushnil(L);  /* still running */
+        return 1;
+    }
+    if (wait == WAIT_FAILED || wait == WAIT_ABANDONED) {
+        CloseHandle(win_async_cmds[slot].hProcess);
+        DeleteFileA(win_async_cmds[slot].out_file);
+        win_async_cmds[slot].in_use = 0;
+        lua_pushnil(L);
         return 1;
     }
 
@@ -923,6 +974,8 @@ static int n_wait_task(lua_State *L) {
         return 1;
     }
     if (result < 0) {
+        remove(posix_async_cmds[slot].out_file);
+        posix_async_cmds[slot].in_use = 0;
         lua_pushnil(L);
         return 1;
     }
@@ -1367,6 +1420,7 @@ static int copy_file(const char *src, const char *dst) {
     while ((n = fread(buf, 1, sizeof(buf), fin)) > 0) {
         if (fwrite(buf, 1, n, fout) != n) { ok = 0; break; }
     }
+    if (ferror(fin)) ok = 0;
     fclose(fin);
     fclose(fout);
     if (!ok) remove(dst);
@@ -1856,9 +1910,10 @@ static const char *json_parse_value(lua_State *L, const char *p, const char *end
 static int n_json_parse(lua_State *L) {
     size_t len;
     const char *json = luaL_checklstring(L, 1, &len);
+    int top = lua_gettop(L);
     const char *p = json_parse_value(L, json, json + len);
     if (!p) {
-        lua_pop(L, 1);
+        lua_settop(L, top);
         lua_pushnil(L);
         lua_pushstring(L, "json parse error");
         return 2;
@@ -1885,6 +1940,7 @@ static const luaL_Reg spkg_lib[] = {
     {"wait_task",        n_wait_task},
     {"remove",           n_remove},
     {"fingerprint",      n_fingerprint},
+    {"self_fingerprint", n_self_fingerprint},
     {"cache_init",       n_cache_init},
     {"cache_get",        n_cache_get},
     {"cache_put",        n_cache_put},
