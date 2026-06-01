@@ -105,4 +105,8 @@ target_include_directories(spkg-node PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+if(UNIX)
+    target_link_libraries(spkg-node PRIVATE pthread)
+endif()
+
 install(TARGETS spkg-node RUNTIME DESTINATION bin)

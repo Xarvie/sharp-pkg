@@ -2,22 +2,23 @@
 
 local M = {}
 
+local function path_join(a, b)
+    if a:sub(-1) == "/" then return a .. b end
+    return a .. "/" .. b
+end
+
 function M.resolve(name, version, home)
     -- Check Sharp.lock first
-    if spkg.file_exists("Sharp.lock") then
-        local ok, lock = pcall(dofile, "Sharp.lock")
-        if ok and lock and lock[name] then
-            return lock[name]
-        end
+    local ok, lock = pcall(dofile, "Sharp.lock")
+    if ok and lock and lock[name] then
+        return lock[name]
     end
 
     -- Read source config (~/.sharp/config.spkm)
-    local config_file = home .. "/.sharp/config.spkm"
+    local config_file = path_join(home, ".sharp/config.spkm")
     local config = nil
-    if spkg.file_exists(config_file) then
-        local ok, cfg = pcall(dofile, config_file)
-        if ok then config = cfg end
-    end
+    local ok2, cfg = pcall(dofile, config_file)
+    if ok2 and cfg then config = cfg end
 
     if config and config.source and config.source[name] then
         return {

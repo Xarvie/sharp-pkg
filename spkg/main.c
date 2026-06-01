@@ -13,8 +13,15 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <errno.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
 #include <pwd.h>
+#endif
 
 #include "lua.h"
 #include "lualib.h"
@@ -101,7 +108,12 @@ static void parse_cli(int argc, char **argv, cli_args_t *out) {
         } else if (strcmp(argv[i], "--all") == 0) {
             out->all_targets = 1;
         } else if (strcmp(argv[i], "--jobs") == 0 && i + 1 < argc) {
-            out->jobs = atoi(argv[++i]);
+            char *end = NULL;
+            errno = 0;
+            long val = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || errno == ERANGE || val <= 0) val = 1;
+            if (val > INT_MAX) val = INT_MAX;
+            out->jobs = (int)val;
         } else if (strcmp(argv[i], "--no-cache") == 0) {
             out->no_cache = 1;
         } else if (strcmp(argv[i], "--dist") == 0) {
@@ -128,8 +140,13 @@ int main(int argc, char **argv) {
 
     const char *home = getenv("HOME");
     if (!home) {
+#ifdef _WIN32
+        home = getenv("USERPROFILE");
+        if (!home) home = "C:\\Users\\Default";
+#else
         struct passwd *pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : "/";
+#endif
     }
 
     /* Create Lua VM */

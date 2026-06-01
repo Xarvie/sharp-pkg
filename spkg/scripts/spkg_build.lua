@@ -602,13 +602,15 @@ function M.build_graph_from_ctx(ctx, include_tests)
             end
 
             for _, fp in ipairs(files) do
-                local stem = fp:gsub("%.ce$", ""):gsub("[/\\]", "_")
+                local ext = fp:match("%.([^%.\\/]+)$") or ""
+                local stem = fp:gsub("%.[^%.\\/]+$", ""):gsub("[/\\]", "_")
                 local output = "build/" .. art.name .. "/" .. stem .. ".o"
                 table.insert(artifact_graph.compile_tasks, {
                     source = fp,
                     output = output,
                     cflags = src_cflags,
                     target = cross_target or "",
+                    src_ext = ext,
                 })
             end
         end
@@ -973,7 +975,23 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
         return true
     end
 
-    start_next()
+    local function drain_running()
+        while #running > 0 do
+            local still_running = {}
+            for _, r in ipairs(running) do
+                local result = spkg.wait_task(r.id)
+                if not result then
+                    table.insert(still_running, r)
+                end
+            end
+            running = still_running
+        end
+    end
+
+    if not start_next() then
+        drain_running()
+        return false
+    end
 
     while #running > 0 do
         local new_running = {}
@@ -986,7 +1004,6 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                 elseif verbose and result.out ~= "" then
                     print("    " .. result.out)
                 end
-                -- Save fingerprint and cache on success
                 if result.ok then
                     save_fingerprint(r.item.task.output, r.item.task.cflags)
                     if not _SPKG_NO_CACHE then
@@ -1002,8 +1019,10 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
         end
         running = new_running
         if #running < max_jobs and #pending > 0 and not any_failed then
-            start_next()
-            if any_failed then break end
+            if not start_next() then
+                drain_running()
+                return false
+            end
         end
     end
 
@@ -1064,71 +1083,161 @@ end
 
 -- ═══════════════════════════════════════════════════════════════
 -- Header Dependency Collection for Distributed Build
+-- Uses compiler-driven dependency scanning instead of Lua regex:
+--   .ce/.c/.i  → sharpc -E -MMD -MF <tmp>.d  → parse depfile
+--   .cpp/.m/.mm/.cxx/.cc → zig cc -MM         → parse stdout
 -- ═══════════════════════════════════════════════════════════════
 
--- Parse #include directives from source code
--- Returns list of include paths (e.g., "stdio.h", "lib/mylib.h")
-local function parse_includes(source)
-    local includes = {}
-    for line in source:gmatch("[^\n]*") do
-        -- Match #include "..." or #include <...>
-        local inc = line:match('#%s*include%s+"([^"]+)"')
-                    or line:match('#%s*include%s+<([^>]+)>')
-        if inc then table.insert(includes, inc) end
-    end
-    return includes
-end
+local CPP_EXTS = { cpp = true, cxx = true, cc = true, ["c++"] = true, m = true, mm = true }
 
--- Resolve an include path against a list of include directories
--- Returns the full path if found, nil otherwise
-local function resolve_include_path(inc_path, include_dirs, source_dir)
-    -- Try include directories from task cflags (-I flags)
-    for _, dir in ipairs(include_dirs) do
-        local full = dir .. "/" .. inc_path
-        if spkg.file_exists(full) then return full end
-    end
-    -- Try relative to source file directory
-    if source_dir and source_dir ~= "" then
-        local full = source_dir .. "/" .. inc_path
-        if spkg.file_exists(full) then return full end
-    end
-    return nil
-end
-
--- Extract -I directories from cflags list
-local function extract_include_dirs(cflags)
+-- Extract all include-relevant flags from cflags:
+--   -I <dir>, -isystem <dir>, -idirafter <dir>, -iquote <dir>
+local function extract_all_includes(cflags)
     local dirs = {}
     for _, flag in ipairs(cflags) do
-        if flag:sub(1, 2) == "-I" then
-            local dir = flag:sub(3)
-            if dir ~= "" then table.insert(dirs, dir) end
-        end
+        local dir = flag:match("^-I(.+)$")
+                 or flag:match("^-isystem%s+(.+)$")
+                 or flag:match("^-idirafter%s+(.+)$")
+                 or flag:match("^-iquote%s+(.+)$")
+        if dir and dir ~= "" then table.insert(dirs, dir) end
     end
     return dirs
 end
 
--- Collect all header dependencies recursively
--- Returns a map: relative_path -> file_content
-local function collect_headers(source, include_dirs, source_dir, visited, depth)
-    visited = visited or {}
-    depth = depth or 0
-    if depth > 10 then return visited end  -- Prevent infinite recursion
+-- Check if a path is a system header (should NOT be bundled to nodes)
+local function is_system_header(path)
+    if path:match("^/usr/include/") then return true end
+    if path:match("^/usr/lib/") then return true end
+    if path:match("^/System/Library/") then return true end
+    return false
+end
 
-    local includes = parse_includes(source)
-    for _, inc in ipairs(includes) do
-        if not visited[inc] then
-            local full_path = resolve_include_path(inc, include_dirs, source_dir)
-            if full_path then
-                local content = spkg.read_file(full_path)
-                if content then
-                    visited[inc] = content
-                    -- Recursively collect headers from this header
-                    collect_headers(content, include_dirs, source_dir, visited, depth + 1)
+-- Parse depfile (.d) output from -MMD into a list of absolute paths
+local function parse_depfile_output(raw, cflags)
+    local headers = {}
+    -- target.o: path1.h path2.h \n path3.h ...
+    raw = raw:gsub("\\\n", " "):gsub("\n", " ")
+    local colon = raw:find(":")
+    if not colon then return headers end
+    local rest = raw:sub(colon + 1)
+    for p in rest:gmatch("%S+") do
+        if not is_system_header(p) and spkg.file_exists(p) then
+            headers[p] = true
+        end
+    end
+    return headers
+end
+
+local function find_zig()
+    local compiler = find_compiler()
+    if not compiler then return nil end
+    local exe_dir = compiler:match("(.*/)")
+    if not exe_dir then return nil end
+    local zig = exe_dir .. "zig"
+    if spkg.file_exists(zig) then return zig end
+    zig = exe_dir .. "../zig/zig"
+    if spkg.file_exists(zig) then return zig end
+    return nil
+end
+
+-- Scan header dependencies using compiler tooling.
+-- For C++/ObjC sources: uses zig cc -MM (compiler-driven).
+-- For Sharp/C sources: uses a fast regex-based fallback (sharpc -E
+-- does not generate depfiles in current version).
+-- Returns set { path → true } or nil on failure.
+local function scan_deps_tool(source_path, cflags, target, sysroot)
+    local ext = source_path:match("%.([^%.\\/]+)$")
+    if not ext then return nil end
+
+    if CPP_EXTS[ext] then
+        local zig = find_zig()
+        if not zig then return nil end
+        local args = { zig, "cc", "-MM", "-MG" }
+        if target and target ~= "" then
+            table.insert(args, "-target")
+            table.insert(args, target)
+        end
+        if sysroot and sysroot ~= "" then
+            table.insert(args, "--sysroot")
+            table.insert(args, sysroot)
+        end
+        for _, f in ipairs(cflags) do table.insert(args, f) end
+        table.insert(args, source_path)
+        local cmd = table.concat(args, " ")
+        local r = spkg.run_cmd(cmd .. " 2>/dev/null")
+        if not r or not r.ok or not r.out then return nil end
+        return parse_depfile_output(r.out, cflags)
+    end
+
+    return nil
+end
+
+-- Collect all header files (read contents into map) for bundling to nodes.
+-- Uses compiler-driven dependency scanning, falls back to regex.
+local function collect_headers_for_task(task)
+    local source = spkg.read_file(task.source)
+    if not source then return nil end
+
+    local sysroot = _SPKG_SYSROOT
+    local target = task.target
+
+    local header_paths = scan_deps_tool(task.source, task.cflags, target, sysroot)
+    if not header_paths then
+        local include_dirs = extract_all_includes(task.cflags)
+        local source_dir = task.source:match("(.*/)") or "."
+        local header_map = {}
+        local function collect_regex(src, depth)
+            if depth > 10 then return end
+            for line in src:gmatch("[^\n]*") do
+                local inc = line:match('#%s*include%s+"([^"]+)"')
+                         or line:match('#%s*include%s+<([^>]+)>')
+                if inc and not header_map[inc] then
+                    for _, dir in ipairs(include_dirs) do
+                        local full = dir .. "/" .. inc
+                        if spkg.file_exists(full) then
+                            local content = spkg.read_file(full)
+                            if content then
+                                header_map[inc] = content
+                                collect_regex(content, depth + 1)
+                            end
+                            break
+                        end
+                    end
+                    if not header_map[inc] and source_dir ~= "" then
+                        local full = source_dir .. "/" .. inc
+                        if spkg.file_exists(full) then
+                            local content = spkg.read_file(full)
+                            if content then
+                                header_map[inc] = content
+                                collect_regex(content, depth + 1)
+                            end
+                        end
+                    end
                 end
             end
         end
+        collect_regex(source, 0)
+        return header_map
     end
-    return visited
+
+    -- Convert path set to path→content map
+    local header_map = {}
+    for p in pairs(header_paths) do
+        if not is_system_header(p) then
+            local content = spkg.read_file(p)
+            if content then
+                local rel = p
+                for _, dir in ipairs(extract_all_includes(task.cflags)) do
+                    if dir ~= "" and p:sub(1, #dir + 1) == dir .. "/" then
+                        rel = p:sub(#dir + 2)
+                        break
+                    end
+                end
+                header_map[rel] = content
+            end
+        end
+    end
+    return header_map
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -1150,6 +1259,179 @@ local function fetch_deps()
         if not spkg_fetch.fetch_recursive(home, deps) then return false end
     end
     return true
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- Parallel Distributed Compilation via curl
+-- ═══════════════════════════════════════════════════════════════
+
+local _curl_avail = nil
+local function curl_available()
+    if _curl_avail == nil then
+        local r = spkg.run_cmd("curl --version 2>/dev/null")
+        _curl_avail = (r and r.ok)
+    end
+    return _curl_avail
+end
+
+local _curl_tmp_id = 0
+local function _curl_tmp_name(prefix)
+    _curl_tmp_id = _curl_tmp_id + 1
+    return "/tmp/spkg_" .. prefix .. "_" .. tostring(_curl_tmp_id)
+end
+
+local function _build_compile_json(source, cflags, headers, opt, src_ext)
+    local cflags_json = "["
+    for i, f in ipairs(cflags) do
+        if i > 1 then cflags_json = cflags_json .. "," end
+        local fe = f:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+        cflags_json = cflags_json .. '"' .. fe .. '"'
+    end
+    cflags_json = cflags_json .. "]"
+
+    local escaped = source:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+
+    local headers_json = ""
+    local first = true
+    for hpath, hcontent in pairs(headers) do
+        if not first then headers_json = headers_json .. "," end
+        first = false
+        local he = hcontent:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+        headers_json = headers_json .. string.format('{"path":"%s","content":"%s"}', hpath, he)
+    end
+
+    return string.format(
+        '{"source":"%s","cflags":%s,"optimize":"%s","headers":[%s],"src_ext":"%s"}',
+        escaped, cflags_json, opt, headers_json, src_ext)
+end
+
+local function _distribute_parallel(task_list, healthy_nodes, verbose)
+    local NH = #healthy_nodes
+    local results = {}
+    local pending = {}
+    local tmp_req_files = {}
+    local tmp_out_files = {}
+
+    -- Phase 1: submit all tasks
+    for ti, entry in ipairs(task_list) do
+        local node = healthy_nodes[((ti - 1) % NH) + 1]
+        local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext)
+
+        local req_file = _curl_tmp_name("req")
+        local out_file = _curl_tmp_name("resp")
+        tmp_req_files[req_file] = true
+        tmp_out_files[out_file] = true
+        spkg.write_file(req_file, req_json)
+
+        local url = "http://" .. node .. "/compile"
+        local cmd = string.format(
+            'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s 2>/dev/null',
+            req_file, out_file, url)
+
+        if verbose then
+            print("  [remote] " .. entry.source_path .. " -> " .. node)
+        else
+            print("  [remote] " .. entry.source_path)
+        end
+
+        local h = spkg.start_cmd(cmd)
+        table.insert(pending, {
+            handle = h,
+            task_idx = ti,
+            node = node,
+            out_file = out_file,
+            attempt = 1,
+        })
+    end
+
+    -- Phase 2: wait for all, retry on failure
+    while #pending > 0 do
+        local still_pending = {}
+        for _, p in ipairs(pending) do
+            local r = spkg.wait_task(p.handle)
+            if r == nil then
+                table.insert(still_pending, p)
+            else
+                -- Task completed, parse result
+                local ok = false
+                local output_b64 = nil
+                local depfile = nil
+                local err_msg = nil
+
+                if r.ok then
+                    local result_raw = spkg.read_file(p.out_file)
+                    if result_raw then
+                        local ok_json, resp = pcall(spkg.json_parse, result_raw)
+                        if ok_json and type(resp) == "table" then
+                            if resp.status == "ok" and resp.output then
+                                output_b64 = resp.output
+                                depfile = resp.depfile
+                                ok = true
+                            else
+                                err_msg = (resp.stderr or "unknown error"):gsub("\n", " "):sub(1, 120)
+                            end
+                        else
+                            err_msg = "unparsable response from " .. p.node
+                        end
+                    else
+                        err_msg = "cannot read response from " .. p.node
+                    end
+                else
+                    err_msg = "request failed (code " .. tostring(r.code) .. ") to " .. p.node
+                end
+
+                if ok then
+                     results[p.task_idx] = { ok = true, output = output_b64, depfile = depfile }
+                 elseif p.attempt < NH then
+                     if p.attempt > 1 then
+                         local delay_ms = math.min(100 * (2 ^ (p.attempt - 2)), 5000)
+                         spkg.run_cmd("sleep " .. (delay_ms / 1000))
+                     end
+
+                     local next_node = healthy_nodes[((p.task_idx - 1 + p.attempt) % NH) + 1]
+                     local entry = task_list[p.task_idx]
+                     local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext)
+
+                     local retry_req = _curl_tmp_name("req_retry")
+                     local retry_out = _curl_tmp_name("resp_retry")
+                     tmp_req_files[retry_req] = true
+                     tmp_out_files[retry_out] = true
+                     spkg.write_file(retry_req, req_json)
+                     p.out_file = retry_out
+
+                     local url = "http://" .. next_node .. "/compile"
+                     local cmd = string.format(
+                         'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s 2>/dev/null',
+                         retry_req, retry_out, url)
+
+                    if verbose then
+                        print("    [retry] " .. entry.source_path .. " -> " .. next_node .. " (" .. (err_msg or "failed") .. ")")
+                    end
+
+                    p.handle = spkg.start_cmd(cmd)
+                    p.node = next_node
+                    p.attempt = p.attempt + 1
+                    table.insert(still_pending, p)
+                else
+                    results[p.task_idx] = { ok = false, error = err_msg or "all nodes failed" }
+                end
+            end
+        end
+        pending = still_pending
+        if #pending > 0 then
+            spkg.run_cmd("sleep 0.1")
+        end
+    end
+
+    -- Cleanup temp files
+    for f in pairs(tmp_req_files) do
+        spkg.remove(f)
+    end
+    for f in pairs(tmp_out_files) do
+        spkg.remove(f)
+    end
+
+    return results
 end
 
 function M.execute_distributed(verbose, max_jobs)
@@ -1182,139 +1464,184 @@ function M.execute_distributed(verbose, max_jobs)
         if not execute_custom_steps(b._custom_steps, verbose) then return false end
     end
 
-    print("spkg: distributed build with " .. #nodes .. " node(s)")
-    for _, n in ipairs(nodes) do print("  node: " .. n) end
-
-    -- 3. Execute each artifact
-    local node_idx = 0
-    for _, art in ipairs(build_graph.artifacts) do
-        if verbose then
-            print("spkg: building " .. art.name .. " [" .. art.type .. "]")
+    -- Health check all nodes, filter out unhealthy ones
+    local healthy = {}
+    for _, n in ipairs(nodes) do
+        local url = "http://" .. n .. "/health"
+        local r = spkg.http_get(url)
+        if r.ok and r.code == 200 then
+            table.insert(healthy, n)
+            if verbose then print("  node " .. n .. ": healthy") end
         else
-            print("spkg: building " .. art.name .. " [" .. art.type .. "]")
+            print("  " .. warn_msg("node " .. n .. " is not responding, skipping"))
         end
+    end
 
+    if #healthy == 0 then
+        print("spkg: no healthy nodes available, falling back to local build.")
+        return M._do_build(verbose, max_jobs)
+    end
+
+    print("spkg: distributed build with " .. #healthy .. "/" .. #nodes .. " healthy node(s)")
+    for _, n in ipairs(healthy) do print("  node: " .. n) end
+
+    local use_parallel = curl_available()
+    if use_parallel and verbose then
+        print("spkg: parallel submission via curl")
+    end
+
+    -- Phase A: collect all pending tasks across artifacts
+    local all_tasks = {}
+    for _, art in ipairs(build_graph.artifacts) do
         for _, task in ipairs(art.compile_tasks) do
             if needs_compile(task.source, task.output, task.cflags) then
                 spkg.mkdir_p("build/" .. art.name)
-
-                -- Read source file
                 local source = spkg.read_file(task.source)
                 if not source then
                     print("  error: cannot read " .. task.source)
                     return false
                 end
-
-                -- Collect header dependencies for distributed build
-                local include_dirs = extract_include_dirs(task.cflags)
-                local source_dir = task.source:match("(.*/)") or "."
-                local headers = collect_headers(source, include_dirs, source_dir)
-
-                -- Try each node (round-robin starting from current idx)
-                local task_ok = false
-                local last_err = ""
-                for attempt = 1, #nodes do
-                    local try_idx = ((node_idx + attempt - 1) % #nodes) + 1
-                    local node = nodes[try_idx]
-
-                    -- Build JSON request with headers
-                    local cflags_json = "["
-                    for i, f in ipairs(task.cflags) do
-                        if i > 1 then cflags_json = cflags_json .. "," end
-                        local f_escaped = f:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-                        cflags_json = cflags_json .. '"' .. f_escaped .. '"'
-                    end
-                    cflags_json = cflags_json .. "]"
-
-                    -- Escape source: backslash first, then quotes and control chars
-                    local escaped = source:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-
-                    -- Build headers JSON: {"path":"path1","content":"..."},{"path":"path2","content":"..."}
-                    local headers_json = ""
-                    local first = true
-                    for hpath, hcontent in pairs(headers) do
-                        if not first then headers_json = headers_json .. "," end
-                        first = false
-                        local h_escaped = hcontent:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
-                        headers_json = headers_json .. string.format('{"path":"%s","content":"%s"}', hpath, h_escaped)
-                    end
-
-                    local opt = _SPKG_OPTIMIZE or "Debug"
-                    local req = string.format(
-                        '{"source":"%s","cflags":%s,"optimize":"%s","headers":[%s]}',
-                        escaped, cflags_json, opt, headers_json)
-
-                    -- Send to node
-                    if verbose and attempt == 1 then
-                        print("  [remote] " .. task.source .. " -> " .. node)
-                    elseif verbose and attempt > 1 then
-                        print("  [retry]  " .. task.source .. " -> " .. node)
-                    else
-                        print("  [remote] " .. task.source)
-                    end
-
-                    local url = "http://" .. node .. "/compile"
-                    local r = spkg.http_post(url, req)
-
-                    if not r.ok or r.code ~= 200 then
-                        last_err = (r.body or ""):gsub("\n", " "):sub(1, 120)
-                        if attempt < #nodes then
-                            -- Try next node
-                        else
-                            print("  error: all nodes failed for " .. task.source)
-                            print("  last error: " .. last_err)
-                            return false
-                        end
-                    else
-                        -- Parse response with proper JSON parser
-                        local ok_json, resp = pcall(spkg.json_parse, r.body)
-                        if not ok_json or type(resp) ~= "table" then
-                            last_err = "unparsable response from node"
-                            if attempt >= #nodes then
-                                print("  error: " .. last_err)
-                                return false
-                            end
-                        elseif resp.status == "error" then
-                            last_err = resp.stderr or "unknown error"
-                            if attempt >= #nodes then
-                                print("  error: " .. last_err)
-                                return false
-                            end
-                        else
-                            -- Success: resp.status == "ok"
-                            local output = resp.output
-                            if output then
-                                local decoded = b64_decode(output)
-                                spkg.write_file(task.output, decoded)
-                                save_fingerprint(task.output, task.cflags)
-
-                                -- Write depfile if present
-                                if resp.depfile and resp.depfile ~= "" then
-                                    local dep_path = task.output:gsub("%.o$", "%.d")
-                                    spkg.write_file(dep_path, resp.depfile)
-                                end
-
-                                task_ok = true
-                                node_idx = try_idx
-                                break
-                            else
-                                last_err = "no output from node"
-                                if attempt >= #nodes then
-                                    print("  error: " .. last_err)
-                                    return false
-                                end
-                            end
-                        end
-                    end
-                end
-
-                if not task_ok then return false end
+                local headers = collect_headers_for_task(task)
+                table.insert(all_tasks, {
+                    source = source,
+                    cflags = task.cflags,
+                    headers = headers,
+                    opt = _SPKG_OPTIMIZE or "Debug",
+                    src_ext = task.src_ext or "ce",
+                    source_path = task.source,
+                    output = task.output,
+                    artifact_name = art.name,
+                })
             else
                 if verbose then print("  [skip] " .. task.source .. " (up to date)") end
             end
         end
+    end
 
-        -- Link step (always local)
+    if #all_tasks == 0 then
+        -- All up-to-date, just do link steps
+        for _, art in ipairs(build_graph.artifacts) do
+            if not link_artifact(art, verbose) then return false end
+        end
+        print("spkg: done (all up-to-date).")
+        return true
+    end
+
+    -- Phase B: execute tasks (parallel or sequential)
+    if use_parallel then
+        -- Parallel submission via curl
+        local results = _distribute_parallel(all_tasks, healthy, verbose)
+        for ti, res in pairs(results) do
+            if res.ok then
+                local task = all_tasks[ti]
+                local decoded = b64_decode(res.output)
+                spkg.write_file(task.output, decoded)
+                save_fingerprint(task.output, task.cflags)
+                if res.depfile and res.depfile ~= "" then
+                    local dep_path = task.output:sub(1, -3) .. ".d"
+                    spkg.write_file(dep_path, res.depfile)
+                end
+            else
+                print("  error: " .. (res.error or "unknown"))
+                return false
+            end
+        end
+    else
+        -- Sequential fallback: round-robin submission
+        local node_idx = 0
+        local node_failures = {}
+        for _, n in ipairs(healthy) do node_failures[n] = 0 end
+
+        for _, task in ipairs(all_tasks) do
+            local task_ok = false
+            local last_err = ""
+            local tried = {}
+            for attempt = 1, #healthy do
+                if attempt > 1 then
+                    local delay_ms = math.min(100 * (2 ^ (attempt - 2)), 5000)
+                    spkg.run_cmd("sleep " .. (delay_ms / 1000))
+                end
+
+                local try_idx = nil
+                for offset = 0, #healthy - 1 do
+                    local candidate = ((node_idx + offset) % #healthy) + 1
+                    local n = healthy[candidate]
+                    if not tried[n] then
+                        try_idx = candidate
+                        tried[n] = true
+                        break
+                    end
+                end
+                if not try_idx then break end
+
+                local node = healthy[try_idx]
+                local req = _build_compile_json(task.source, task.cflags, task.headers or {}, task.opt, task.src_ext)
+
+                if verbose then
+                    local tag = (attempt == 1) and "remote" or "retry"
+                    print("  [" .. tag .. "] " .. task.source_path .. " -> " .. node)
+                else
+                    print("  [remote] " .. task.source_path)
+                end
+
+                local url = "http://" .. node .. "/compile"
+                local r = spkg.http_post(url, req)
+
+                if not r.ok or r.code ~= 200 then
+                    node_failures[node] = (node_failures[node] or 0) + 1
+                    last_err = (r.body or ""):gsub("\n", " "):sub(1, 120)
+                    if r.code == 503 then last_err = "node busy"
+                    elseif r.code <= 0 then last_err = "connection failed" end
+                    if verbose and attempt < #healthy then
+                        print("    " .. node .. ": " .. last_err .. " (trying next node)")
+                    end
+                    if attempt >= #healthy then
+                        print("  error: all nodes failed for " .. task.source_path)
+                        print("  last error (" .. node .. "): " .. last_err)
+                        return false
+                    end
+                else
+                    local ok_json, resp = pcall(spkg.json_parse, r.body)
+                    if not ok_json or type(resp) ~= "table" then
+                        last_err = "unparsable response from " .. node
+                        if attempt >= #healthy then
+                            print("  error: " .. last_err)
+                            return false
+                        end
+                    elseif resp.status == "error" then
+                        last_err = (resp.stderr or "unknown error"):gsub("\n", " "):sub(1, 120)
+                        if attempt >= #healthy then
+                            print("  error (" .. node .. "): " .. last_err)
+                            return false
+                        end
+                    else
+                        if resp.output then
+                            local decoded = b64_decode(resp.output)
+                            spkg.write_file(task.output, decoded)
+                            save_fingerprint(task.output, task.cflags)
+                            if resp.depfile and resp.depfile ~= "" then
+                                local dep_path = task.output:sub(1, -3) .. ".d"
+                                spkg.write_file(dep_path, resp.depfile)
+                            end
+                            task_ok = true
+                            node_idx = try_idx
+                            break
+                        else
+                            last_err = "no output from " .. node
+                            if attempt >= #healthy then
+                                print("  error: " .. last_err)
+                                return false
+                            end
+                        end
+                    end
+                end
+            end
+            if not task_ok then return false end
+        end
+    end
+
+    -- Phase C: link steps (always local)
+    for _, art in ipairs(build_graph.artifacts) do
         if not link_artifact(art, verbose) then return false end
     end
 

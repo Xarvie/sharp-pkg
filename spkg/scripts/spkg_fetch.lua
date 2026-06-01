@@ -77,6 +77,10 @@ local function resolve_dep(dep, home)
     }
 end
 
+local function shell_escape_path(path)
+    return path:gsub("'", "'\\''")
+end
+
 local function clone_dep(resolved, pkg_dir)
     if spkg.dir_exists(pkg_dir) then
         print("  [cached] " .. (resolved.name or "unknown"))
@@ -108,7 +112,7 @@ local function clone_dep(resolved, pkg_dir)
         return false
     end
 
-    cmd = "cd '" .. pkg_dir .. "' && git rev-parse HEAD"
+    cmd = "cd '" .. shell_escape_path(pkg_dir) .. "' && git rev-parse HEAD"
     r = spkg.run_cmd(cmd)
     local commit = r and r.ok and r.out and r.out:gsub("%s+", "") or nil
     if commit and commit ~= "" then
@@ -275,8 +279,7 @@ function M.check_updates(deps)
                 local cmd = string.format('git clone --depth 1 "%s" "%s" 2>&1', resolved.url, tmpdir)
                 local r = spkg.run_cmd(cmd)
                 if r and r.ok then
-                    local cmd2 = "cd '" .. tmpdir .. "' && git rev-parse HEAD"
-                    local r2 = spkg.run_cmd(cmd2)
+                    local r2 = spkg.run_cmd("cd '" .. shell_escape_path(tmpdir) .. "' && git rev-parse HEAD")
                     local remote_commit = r2 and r2.ok and r2.out and r2.out:gsub("%s+", "") or nil
 
                     if remote_commit and remote_commit ~= locked.commit then

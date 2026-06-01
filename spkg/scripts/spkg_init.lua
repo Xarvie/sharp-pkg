@@ -93,13 +93,16 @@ spkg — Sharp Package Manager
     end
 end
 
-function spkg_dump_lua(val, indent)
+function spkg_dump_lua(val, indent, visited)
     indent = indent or 0
+    visited = visited or {}
     local t = type(val)
     if t == "string" then return string.format("%q", val) end
     if t == "number" or t == "boolean" then return tostring(val) end
     if t == "nil" then return "nil" end
     if t == "table" then
+        if visited[val] then return '"<cycle>"' end
+        visited[val] = true
         local pad = string.rep("  ", indent)
         local max_k = 0
         local is_arr = true
@@ -110,16 +113,31 @@ function spkg_dump_lua(val, indent)
         if is_arr and max_k > 0 then
             local parts = {}
             for i = 1, max_k do
-                table.insert(parts, pad .. "  " .. spkg_dump_lua(val[i], indent + 1))
+                table.insert(parts, pad .. "  " .. spkg_dump_lua(val[i], indent + 1, visited))
             end
             return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
         end
         local keys = {}
-        for k, _ in pairs(val) do table.insert(keys, k) end
-        table.sort(keys)
+        for k, _ in pairs(val) do
+            if type(k) == "number" then
+                table.insert(keys, {k = k, sort_key = string.format("%020d", k)})
+            else
+                table.insert(keys, {k = k, sort_key = tostring(k)})
+            end
+        end
+        table.sort(keys, function(a, b) return a.sort_key < b.sort_key end)
         local parts = {}
-        for _, k in ipairs(keys) do
-            table.insert(parts, pad .. "  " .. k .. " = " .. spkg_dump_lua(val[k], indent + 1))
+        for _, entry in ipairs(keys) do
+            local k = entry.k
+            local key_str
+            if type(k) == "number" then
+                key_str = string.format("[%d]", k)
+            elseif tostring(k):match("^[%a_][%w_]*$") then
+                key_str = k
+            else
+                key_str = string.format("[%q]", k)
+            end
+            table.insert(parts, pad .. "  " .. key_str .. " = " .. spkg_dump_lua(val[k], indent + 1, visited))
         end
         return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
     end

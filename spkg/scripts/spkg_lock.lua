@@ -30,7 +30,6 @@ function M.save_one(dep)
 end
 
 function M.load()
-    if not spkg.file_exists("Sharp.lock") then return nil end
     local ok, lock = pcall(dofile, "Sharp.lock")
     if not ok then return nil end
     return lock

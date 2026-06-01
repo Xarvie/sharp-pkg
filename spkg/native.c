@@ -422,7 +422,7 @@ static int n_glob(lua_State *L) {
     }
     return 1;
 #else
-    char cmd[4096];
+    char cmd[8192];
     if (strstr(pattern, "**")) {
         char base[1024] = ".";
         const char *name = "*";
@@ -437,8 +437,33 @@ static int n_glob(lua_State *L) {
         }
         const char *last_slash = strrchr(pattern, '/');
         if (last_slash && last_slash > dbl_star) name = last_slash + 1;
+        char safe_base[2048], safe_name[2048];
+        {
+            size_t bi = 0;
+            for (const char *p = base; *p && bi < sizeof(safe_base) - 5; p++) {
+                if (*p == '\'') {
+                    safe_base[bi++] = '\''; safe_base[bi++] = '\\';
+                    safe_base[bi++] = '\''; safe_base[bi++] = '\'';
+                } else {
+                    safe_base[bi++] = *p;
+                }
+            }
+            safe_base[bi] = '\0';
+        }
+        {
+            size_t ni = 0;
+            for (const char *p = name; *p && ni < sizeof(safe_name) - 5; p++) {
+                if (*p == '\'') {
+                    safe_name[ni++] = '\''; safe_name[ni++] = '\\';
+                    safe_name[ni++] = '\''; safe_name[ni++] = '\'';
+                } else {
+                    safe_name[ni++] = *p;
+                }
+            }
+            safe_name[ni] = '\0';
+        }
         snprintf(cmd, sizeof(cmd),
-                 "find '%s' -name '%s' -type f 2>/dev/null", base, name);
+                 "find '%s' -name '%s' -type f 2>/dev/null", safe_base, safe_name);
         FILE *fp = popen(cmd, "r");
         lua_newtable(L);
         if (fp) {
@@ -951,9 +976,20 @@ static int n_remove(lua_State *L) {
     }
     int r;
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-        /* RemoveDirectoryA only works on empty dirs; use a simple recursive approach */
         char cmd[PATH_MAX + 64];
-        snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", path);
+        char safe_path[PATH_MAX * 2];
+        {
+            size_t si = 0;
+            for (const char *p = path; *p && si < sizeof(safe_path) - 3; p++) {
+                if (*p == '"') {
+                    safe_path[si++] = '"'; safe_path[si++] = '"';
+                } else {
+                    safe_path[si++] = *p;
+                }
+            }
+            safe_path[si] = '\0';
+        }
+        snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", safe_path);
         r = system(cmd);
     } else {
         r = DeleteFileA(path) ? 0 : -1;
@@ -1437,7 +1473,19 @@ static int n_cache_stats(lua_State *L) {
     /* Count cache entries and total size */
 #ifdef _WIN32
     char cmd[PATH_MAX + 128];
-    snprintf(cmd, sizeof(cmd), "dir /b /ad \"%s\" 2>nul | find /c /v \"\"", dir);
+    char safe_dir[PATH_MAX * 2];
+    {
+        size_t si = 0;
+        for (const char *p = dir; *p && si < sizeof(safe_dir) - 3; p++) {
+            if (*p == '"') {
+                safe_dir[si++] = '"'; safe_dir[si++] = '"';
+            } else {
+                safe_dir[si++] = *p;
+            }
+        }
+        safe_dir[si] = '\0';
+    }
+    snprintf(cmd, sizeof(cmd), "dir /b /ad \"%s\" 2>nul | find /c /v \"\"", safe_dir);
     FILE *cmd_fp = popen(cmd, "r");
     if (cmd_fp) {
         char line[64];
@@ -1500,7 +1548,19 @@ static int n_cache_clear(lua_State *L) {
 
 #ifdef _WIN32
     char cmd[PATH_MAX + 64];
-    snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", dir);
+    char safe_dir[PATH_MAX * 2];
+    {
+        size_t si = 0;
+        for (const char *p = dir; *p && si < sizeof(safe_dir) - 3; p++) {
+            if (*p == '"') {
+                safe_dir[si++] = '"'; safe_dir[si++] = '"';
+            } else {
+                safe_dir[si++] = *p;
+            }
+        }
+        safe_dir[si] = '\0';
+    }
+    snprintf(cmd, sizeof(cmd), "rmdir /s /q \"%s\"", safe_dir);
     lua_pushboolean(L, system(cmd) == 0);
 #else
     lua_pushboolean(L, remove_recursive(dir) == 0);
@@ -1619,7 +1679,20 @@ static int n_custom_exec(lua_State *L) {
 
     char full_cmd[8192];
     if (workdir && workdir[0]) {
-        int n = snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", workdir, cmd);
+        char safe_workdir[PATH_MAX];
+        {
+            size_t wi = 0;
+            for (const char *p = workdir; *p && wi < sizeof(safe_workdir) - 5; p++) {
+                if (*p == '\'') {
+                    safe_workdir[wi++] = '\''; safe_workdir[wi++] = '\\';
+                    safe_workdir[wi++] = '\''; safe_workdir[wi++] = '\'';
+                } else {
+                    safe_workdir[wi++] = *p;
+                }
+            }
+            safe_workdir[wi] = '\0';
+        }
+        int n = snprintf(full_cmd, sizeof(full_cmd), "cd '%s' && %s", safe_workdir, cmd);
         if (n < 0 || (size_t)n >= sizeof(full_cmd)) {
             lua_newtable(L);
             lua_pushboolean(L, 0); lua_setfield(L, -2, "ok");
@@ -1680,6 +1753,119 @@ static int n_custom_exec(lua_State *L) {
     return 1;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * JSON Parser (minimal, for parsing node responses)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static const char *json_skip_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+static const char *json_parse_string(const char *p, const char *end, char *buf, size_t bufsize) {
+    if (p >= end || *p != '"') return NULL;
+    p++;
+    size_t i = 0;
+    while (p < end && *p != '"' && i < bufsize - 1) {
+        if (*p == '\\' && p + 1 < end) {
+            p++;
+            switch (*p) {
+                case '"':  buf[i++] = '"';  break;
+                case '\\': buf[i++] = '\\'; break;
+                case '/':  buf[i++] = '/';  break;
+                case 'n':  buf[i++] = '\n'; break;
+                case 'r':  buf[i++] = '\r'; break;
+                case 't':  buf[i++] = '\t'; break;
+                case 'b':  buf[i++] = '\b'; break;
+                case 'f':  buf[i++] = '\f'; break;
+                default:   buf[i++] = *p;   break;
+            }
+        } else {
+            buf[i++] = *p;
+        }
+        p++;
+    }
+    if (p < end && *p == '"') p++;
+    buf[i] = '\0';
+    return p;
+}
+
+static const char *json_parse_value(lua_State *L, const char *p, const char *end);
+
+static const char *json_parse_object(lua_State *L, const char *p, const char *end) {
+    p = json_skip_ws(p, end);
+    if (p >= end || *p != '{') return NULL;
+    p++;
+    lua_newtable(L);
+    p = json_skip_ws(p, end);
+    if (p < end && *p == '}') return p + 1;
+    while (p < end) {
+        p = json_skip_ws(p, end);
+        char key[256];
+        p = json_parse_string(p, end, key, sizeof(key));
+        if (!p) { lua_pop(L, 1); return NULL; }
+        p = json_skip_ws(p, end);
+        if (p >= end || *p != ':') { lua_pop(L, 1); return NULL; }
+        p++;
+        p = json_skip_ws(p, end);
+        p = json_parse_value(L, p, end);
+        if (!p) { lua_pop(L, 1); return NULL; }
+        lua_setfield(L, -2, key);
+        p = json_skip_ws(p, end);
+        if (p < end && *p == ',') { p++; continue; }
+        if (p < end && *p == '}') return p + 1;
+        lua_pop(L, 1);
+        return NULL;
+    }
+    lua_pop(L, 1);
+    return NULL;
+}
+
+static const char *json_parse_value(lua_State *L, const char *p, const char *end) {
+    if (p >= end) return NULL;
+    if (*p == '"') {
+        char buf[8192];
+        p = json_parse_string(p, end, buf, sizeof(buf));
+        if (!p) return NULL;
+        lua_pushstring(L, buf);
+        return p;
+    }
+    if (*p == '{') return json_parse_object(L, p, end);
+    if (p + 4 <= end && memcmp(p, "true", 4) == 0) {
+        lua_pushboolean(L, 1);
+        return p + 4;
+    }
+    if (p + 5 <= end && memcmp(p, "false", 5) == 0) {
+        lua_pushboolean(L, 0);
+        return p + 5;
+    }
+    if (p + 4 <= end && memcmp(p, "null", 4) == 0) {
+        lua_pushnil(L);
+        return p + 4;
+    }
+    if (*p == '-' || (*p >= '0' && *p <= '9')) {
+        char *endptr = NULL;
+        double val = strtod(p, &endptr);
+        if (endptr == p) return NULL;
+        lua_pushnumber(L, val);
+        return endptr;
+    }
+    return NULL;
+}
+
+static int n_json_parse(lua_State *L) {
+    size_t len;
+    const char *json = luaL_checklstring(L, 1, &len);
+    const char *p = json_parse_value(L, json, json + len);
+    if (!p) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, "json parse error");
+        return 2;
+    }
+    return 1;
+}
+
 /* ── register ────────────────────────────────────────────────────── */
 static const luaL_Reg spkg_lib[] = {
     {"run_cmd",          n_run_cmd},
@@ -1711,6 +1897,7 @@ static const luaL_Reg spkg_lib[] = {
     {"colorize",         n_colorize},
     {"is_tty",           n_is_tty},
     {"tty_width",        n_tty_width},
+    {"json_parse",       n_json_parse},
     {NULL, NULL}
 };
 

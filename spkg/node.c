@@ -14,35 +14,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <unistd.h>
 #include <limits.h>
+#include <time.h>
+#include <errno.h>
+
+#ifdef _WIN32
+#error "spkg-node does not support Windows. The distributed compilation server requires POSIX (fork/exec)."
+#endif
+
+#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
-#include <time.h>
-#include <errno.h>
 #include <dirent.h>
-
-#ifdef _WIN32
-#define PATH_SEP '\\'
-#define PATH_SEP_STR "\\"
-#else
-#define PATH_SEP '/'
-#define PATH_SEP_STR "/"
-#endif
 
 static int is_executable(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     fclose(f);
-#ifdef _WIN32
-    const char *ext = strrchr(path, '.');
-    return (ext && (strcmp(ext, ".exe") == 0 || strcmp(ext, ".bat") == 0 ||
-                    strcmp(ext, ".cmd") == 0));
-#else
-    /* Check execute permission */
     return access(path, X_OK) == 0;
-#endif
 }
 
 static int resolve_self_exe(char *buf, size_t sz) {
@@ -52,8 +42,6 @@ static int resolve_self_exe(char *buf, size_t sz) {
 #elif defined(__APPLE__)
     uint32_t n = sz > UINT32_MAX ? UINT32_MAX : (uint32_t)sz;
     if (_NSGetExecutablePath(buf, &n) == 0) return 1;
-#elif defined(_WIN32)
-    if (GetModuleFileNameA(NULL, buf, (DWORD)sz) > 0) return 1;
 #else
     (void)buf; (void)sz;
 #endif
@@ -68,25 +56,11 @@ static const char *find_sharpc_path(char *buf, size_t sz) {
     char self_exe[PATH_MAX];
     if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
 
-    /* Find the LAST separator (strrchr), not the first */
-    char *slash = strrchr(self_exe, PATH_SEP);
-#ifdef _WIN32
-    if (!slash) slash = strrchr(self_exe, '/');
-#endif
+    char *slash = strrchr(self_exe, '/');
     if (!slash) return NULL;
     *slash = '\0';
     size_t dirlen = strlen(self_exe);
 
-#ifdef _WIN32
-    const char *rel[] = {
-        "..\\..\\sharpc\\bin\\sharpc.exe",
-        "..\\..\\..\\build\\sharpc.exe",
-        "..\\..\\build\\sharpc.exe",
-        "..\\build\\sharpc.exe",
-        "..\\sharpc.exe",
-        NULL
-    };
-#else
     const char *rel[] = {
         "../../sharpc/bin/sharpc",
         "../../../build/sharpc",
@@ -95,13 +69,12 @@ static const char *find_sharpc_path(char *buf, size_t sz) {
         "../sharpc",
         NULL
     };
-#endif
     for (int i = 0; rel[i]; i++) {
         size_t rlen = strlen(rel[i]);
         size_t need = dirlen + 1 + rlen + 1;
         if (need > sz) continue;
         memcpy(buf, self_exe, dirlen);
-        buf[dirlen] = PATH_SEP;
+        buf[dirlen] = '/';
         memcpy(buf + dirlen + 1, rel[i], rlen + 1);
         if (is_executable(buf)) return buf;
     }
@@ -251,22 +224,11 @@ static char *parse_headers(struct mg_str json) {
 static int compile_task(const char *source_content, const char *cflags_str,
                         const char *optimize, char *out_path, size_t out_path_size,
                         char *depfile_content, size_t depfile_buf_size,
-                        char *error_out, size_t error_buf_size) {
-#ifdef _WIN32
-    char src_path[MAX_PATH];
-    char tmp_dir[MAX_PATH];
-    DWORD tmp_len = GetTempPathA(sizeof(tmp_dir), tmp_dir);
-    if (tmp_len == 0 || tmp_len >= sizeof(tmp_dir)) return -1;
-    char tmp_name[MAX_PATH];
-    if (GetTempFileNameA(tmp_dir, "spk", 0, tmp_name) == 0) return -1;
-    snprintf(src_path, sizeof(src_path), "%s", tmp_name);
-    if (GetTempFileNameA(tmp_dir, "spk", 0, tmp_name) == 0) return -1;
-    snprintf(out_path, out_path_size, "%s", tmp_name);
-#else
+                        char *error_out, size_t error_buf_size,
+                        const char *src_ext) {
     char src_template[] = "/tmp/spkg_src_XXXXXX";
     char out_template[] = "/tmp/spkg_out_XXXXXX";
 
-    /* Create unique temp files using mkstemp (template must end with XXXXXX) */
     int src_fd = mkstemp(src_template);
     if (src_fd < 0) return -1;
     close(src_fd);
@@ -278,16 +240,16 @@ static int compile_task(const char *source_content, const char *cflags_str,
     }
     close(out_fd);
 
-    /* Build actual paths with extensions */
     char src_path[PATH_MAX];
-    snprintf(src_path, sizeof(src_path), "%s.ce", src_template);
+    snprintf(src_path, sizeof(src_path), "%s.%s", src_template, src_ext);
     rename(src_template, src_path);
     snprintf(out_path, out_path_size, "%s.o", out_template);
-#endif
+
+    remove(out_template);
 
     /* Write source to temp file */
     FILE *fp = fopen(src_path, "w");
-    if (!fp) { return -1; }
+    if (!fp) { remove(src_path); return -1; }
     fputs(source_content, fp);
     fclose(fp);
 
@@ -303,12 +265,29 @@ static int compile_task(const char *source_content, const char *cflags_str,
         else if (strcmp(optimize, "ReleaseSmall") == 0) opt_flag = "-Os";
     }
 
-    /* Convert pipe-separated cflags to space-separated for shell execution */
-    char cflags_safe[2048];
+    /* Shell-escape pipe-separated cflags tokens into single-quoted args */
+    char cflags_safe[4096];
     if (cflags_str && cflags_str[0]) {
         size_t ci = 0;
-        for (size_t i = 0; cflags_str[i] && ci < sizeof(cflags_safe) - 1; i++) {
-            cflags_safe[ci++] = (cflags_str[i] == '|') ? ' ' : cflags_str[i];
+        size_t token_start = 0;
+        for (size_t i = 0; ; i++) {
+            if (cflags_str[i] == '|' || cflags_str[i] == '\0') {
+                if (i > token_start && ci + 4 < sizeof(cflags_safe)) {
+                    if (ci > 0) cflags_safe[ci++] = ' ';
+                    cflags_safe[ci++] = '\'';
+                    for (size_t j = token_start; j < i && ci + 4 < sizeof(cflags_safe); j++) {
+                        if (cflags_str[j] == '\'') {
+                            cflags_safe[ci++] = '\''; cflags_safe[ci++] = '\\';
+                            cflags_safe[ci++] = '\''; cflags_safe[ci++] = '\'';
+                        } else {
+                            cflags_safe[ci++] = cflags_str[j];
+                        }
+                    }
+                    cflags_safe[ci++] = '\'';
+                }
+                token_start = i + 1;
+                if (cflags_str[i] == '\0') break;
+            }
         }
         cflags_safe[ci] = '\0';
     } else {
@@ -366,8 +345,8 @@ static int compile_task(const char *source_content, const char *cflags_str,
         if (select(pipe_fd[0] + 1, &rfds, NULL, NULL, &tv) > 0) {
             char tmp[4096];
             ssize_t nr = read(pipe_fd[0], tmp, sizeof(tmp));
-            if (nr > 0 && error_out && error_buf_size > 0) {
-                size_t space = error_buf_size - 1 - err_total;
+            if (nr > 0) {
+                size_t space = sizeof(err_buf) - 1 - err_total;
                 if ((size_t)nr < space) {
                     memcpy(err_buf + err_total, tmp, (size_t)nr);
                     err_total += (size_t)nr;
@@ -377,11 +356,7 @@ static int compile_task(const char *source_content, const char *cflags_str,
         }
 
         if (w > 0) {
-#ifdef _WIN32
             ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
-#else
-            ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
-#endif
             break;
         }
 
@@ -400,8 +375,7 @@ static int compile_task(const char *source_content, const char *cflags_str,
         char tmp[4096];
         ssize_t nr;
         while ((nr = read(pipe_fd[0], tmp, sizeof(tmp))) > 0) {
-            if (error_out && error_buf_size > 0 &&
-                err_total + (size_t)nr < error_buf_size - 1) {
+            if (err_total + (size_t)nr < sizeof(err_buf) - 1) {
                 memcpy(err_buf + err_total, tmp, (size_t)nr);
                 err_total += (size_t)nr;
                 err_buf[err_total] = '\0';
@@ -492,8 +466,28 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
         char cflags[2048] = {0};
         char optimize[64] = {0};
+        char src_ext[16] = "ce";
         json_get_cflags(hm->body, cflags, sizeof(cflags));
         json_get_str(hm->body, "optimize", optimize, sizeof(optimize));
+
+        {
+            char tmp_ext[16];
+            if (json_get_str(hm->body, "src_ext", tmp_ext, sizeof(tmp_ext)) && tmp_ext[0]) {
+                int valid = 1;
+                for (int i = 0; tmp_ext[i]; i++) {
+                    if (!((tmp_ext[i] >= 'a' && tmp_ext[i] <= 'z') ||
+                          (tmp_ext[i] >= 'A' && tmp_ext[i] <= 'Z') ||
+                          (tmp_ext[i] >= '0' && tmp_ext[i] <= '9') ||
+                          tmp_ext[i] == '+' || tmp_ext[i] == '_' ||
+                          tmp_ext[i] == '-'))
+                        valid = 0;
+                }
+                if (valid) {
+                    size_t need = strlen(tmp_ext) + 1;
+                    if (need <= sizeof(src_ext)) memcpy(src_ext, tmp_ext, need);
+                }
+            }
+        }
 
         /* Parse headers and create temp header dir */
         char *hdr_dir = parse_headers(hm->body);
@@ -514,12 +508,13 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 
         char out_path[512];
         char depfile_content[4096];
-        char error_out[4096];
+        char error_out[4096] = {0};
         int rc = compile_task(source, cflags,
                               optimize[0] ? optimize : NULL,
                               out_path, sizeof(out_path),
                               depfile_content, sizeof(depfile_content),
-                              error_out, sizeof(error_out));
+                              error_out, sizeof(error_out),
+                              src_ext);
 
         g_active--;
 
@@ -590,6 +585,26 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data) {
             send_json(c, 500,
                       "{\"status\":\"error\",\"code\":4,"
                       "\"stderr\":\"read .o file failed\"}");
+            goto cleanup;
+        }
+
+        /* Validate output: non-empty and has valid object file magic */
+        if (osize < 4 || (odata[0] == '\x7f' && odata[1] == 'E' && odata[2] == 'L' && odata[3] == 'F')) {
+            /* Valid ELF object file */
+        }
+#ifdef __APPLE__
+        else if (osize >= 4 && (
+            (odata[0] == '\xfe' && odata[1] == '\xed' && odata[2] == '\xfa' && (odata[3] == '\xce' || odata[3] == '\xcf')) ||
+            (odata[0] == '\xce' && odata[1] == '\xfa' && odata[2] == '\xed' && odata[3] == '\xfe') ||
+            (odata[0] == '\xcf' && odata[1] == '\xfa' && odata[2] == '\xed' && odata[3] == '\xfe'))) {
+            /* Valid Mach-O object file */
+        }
+#endif
+        else {
+            free(odata); remove(out_path);
+            send_json(c, 500,
+                      "{\"status\":\"error\",\"code\":4,"
+                      "\"stderr\":\"compilation produced invalid object file\"}");
             goto cleanup;
         }
 
