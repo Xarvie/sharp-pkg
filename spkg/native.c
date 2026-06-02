@@ -681,6 +681,29 @@ static int n_cwd(lua_State *L) {
     return 1;
 }
 
+/* ── spkg.chdir ────────────────────────────────────────────────────── */
+static int n_chdir(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+#ifdef _WIN32
+    if (_chdir(path) == 0) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, strerror(errno));
+        return 2;
+    }
+#else
+    if (chdir(path) == 0) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, strerror(errno));
+        return 2;
+    }
+#endif
+    return 1;
+}
+
 /* ── spkg.get_mtime ──────────────────────────────────────────────── */
 static int n_get_mtime(lua_State *L) {
     const char *path = luaL_checkstring(L, 1);
@@ -977,6 +1000,15 @@ static int n_start_cmd(lua_State *L) {
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
         close(fd);
+
+        /* Set TMPDIR to current directory so compilers create temp files
+           on the same filesystem as their output, avoiding EXDEV rename
+           failures when /tmp and the build directory are on different fs. */
+        char cwd_buf[PATH_MAX];
+        if (getcwd(cwd_buf, sizeof(cwd_buf))) {
+            setenv("TMPDIR", cwd_buf, 1);
+        }
+
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -1968,6 +2000,7 @@ static const luaL_Reg spkg_lib[] = {
     {"find_zigcc",       n_find_zigcc},
     {"home_dir",         n_home_dir},
     {"cwd",              n_cwd},
+    {"chdir",            n_chdir},
     {"get_mtime",        n_get_mtime},
     {"current_platform", n_current_platform},
     {"start_cmd",        n_start_cmd},

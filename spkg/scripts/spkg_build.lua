@@ -286,6 +286,10 @@ local function create_build_context()
 
     function ctx:add_executable(opts)
         local name = opts and opts.name or "main"
+        -- Check for duplicate artifact
+        for _, existing in ipairs(artifacts) do
+            if existing.name == name then return existing end
+        end
         local art = create_artifact(name, "exe")
         table.insert(artifacts, art)
         return art
@@ -293,6 +297,10 @@ local function create_build_context()
 
     function ctx:add_static_library(opts)
         local name = opts and opts.name or "lib"
+        -- Check for duplicate artifact
+        for _, existing in ipairs(artifacts) do
+            if existing.name == name then return existing end
+        end
         local art = create_artifact(name, "staticlib")
         table.insert(artifacts, art)
         return art
@@ -300,6 +308,10 @@ local function create_build_context()
 
     function ctx:add_shared_library(opts)
         local name = opts and opts.name or "lib"
+        -- Check for duplicate artifact
+        for _, existing in ipairs(artifacts) do
+            if existing.name == name then return existing end
+        end
         local art = create_artifact(name, "sharedlib")
         table.insert(artifacts, art)
         return art
@@ -817,7 +829,7 @@ local function cache_key_for(task)
            header_context_fingerprint(task)
 end
 
-local function needs_compile(source, output, cflags)
+local function needs_compile(source, output, cflags, target)
     local src_mtime = spkg.get_mtime(source)
     if not src_mtime then
         if spkg.file_exists(output) then spkg.remove(output) end
@@ -838,6 +850,9 @@ local function needs_compile(source, output, cflags)
 
     local fp_file = output .. ".fp"
     local new_fp = compute_fingerprint(cflags or {})
+    if target and target ~= "" then
+        new_fp = new_fp .. "_" .. target
+    end
     if spkg.file_exists(fp_file) then
         local old_fp = spkg.read_file(fp_file)
         if old_fp ~= new_fp then return true end
@@ -848,9 +863,12 @@ local function needs_compile(source, output, cflags)
     return src_mtime > out_mtime
 end
 
-local function save_fingerprint(output, cflags)
+local function save_fingerprint(output, cflags, target)
     local fp_file = output .. ".fp"
     local fp = compute_fingerprint(cflags or {})
+    if target and target ~= "" then
+        fp = fp .. "_" .. target
+    end
     spkg.write_file(fp_file, fp)
 end
 
@@ -887,7 +905,7 @@ local function compile_task(task, verbose)
         local cache_key = cache_key_for(task)
         if spkg.cache_get(cache_key, task.output) then
             if verbose then print("  [cache hit] " .. task.source) end
-            save_fingerprint(task.output, task.cflags)
+            save_fingerprint(task.output, task.cflags, task.target)
             return true
         end
     end
@@ -898,7 +916,6 @@ local function compile_task(task, verbose)
         return false
     end
 
-    if not verbose then print(status_color("sp", task.source)) end
     if verbose then print("  " .. cmd) end
 
     local r = spkg.run_cmd(cmd)
@@ -914,7 +931,7 @@ local function compile_task(task, verbose)
     end
 
     -- Save fingerprint on success
-    save_fingerprint(task.output, task.cflags)
+    save_fingerprint(task.output, task.cflags, task.target)
 
     if verbose and r.out and r.out ~= "" then print("    " .. r.out) end
     return true
@@ -1033,7 +1050,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
             local cache_key = cache_key_for(task)
             if spkg.cache_get(cache_key, task.output) then
                 if verbose then print("  [cache hit] " .. task.source) end
-                save_fingerprint(task.output, task.cflags)
+                save_fingerprint(task.output, task.cflags, task.target)
             else
                 table.insert(pending, { task = task })
             end
@@ -1074,7 +1091,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                     table.insert(still_running, r)
                 else
                     if result.ok then
-                        save_fingerprint(r.item.task.output, r.item.task.cflags)
+                        save_fingerprint(r.item.task.output, r.item.task.cflags, r.item.task.target)
                         spkg.cache_put(cache_key_for(r.item.task), r.item.task.output)
                     end
                 end
@@ -1100,7 +1117,7 @@ local function compile_tasks_parallel(tasks, verbose, max_jobs)
                     print("    " .. result.out)
                 end
                 if result.ok then
-                    save_fingerprint(r.item.task.output, r.item.task.cflags)
+                    save_fingerprint(r.item.task.output, r.item.task.cflags, r.item.task.target)
                     if not _SPKG_NO_CACHE then
                         spkg.cache_put(cache_key_for(r.item.task), r.item.task.output)
                     end
@@ -1340,6 +1357,130 @@ local function fetch_deps()
 end
 
 -- ═══════════════════════════════════════════════════════════════
+-- Dependency Config Loading
+-- ═══════════════════════════════════════════════════════════════
+--
+-- After dependencies are fetched into spkg_packages/<name>/,
+-- this function recursively loads each dep's config.spkg using
+-- the SAME build context (b). This ensures that:
+--   1. All artifacts from all packages share the same registry
+--   2. ctx:dependency(name) can find artifacts across packages
+--   3. link_artifact("dep_artifact_name") resolves correctly
+--   4. collect_transitive_deps can build the full dependency graph
+
+local function load_dep_configs(b, visited)
+    visited = visited or {}
+
+    local deps = b and b._deps or {}
+    if #deps == 0 then return true end
+
+    for _, dep in ipairs(deps) do
+        local name = dep.name
+        if visited[name] then goto continue end
+        visited[name] = true
+
+        local dep_dir = "spkg_packages/" .. name
+        local config_path = dep_dir .. "/config.spkg"
+        if not spkg.file_exists(config_path) then
+            if _SPKG_VERBOSE then
+                print("spkg: warning: no config.spkg in dependency '" .. name .. "'")
+            end
+            goto continue
+        end
+
+        -- Save original methods so we can restore them after loading
+        local orig_add_executable = b.add_executable
+        local orig_add_static_library = b.add_static_library
+        local orig_add_shared_library = b.add_shared_library
+
+        -- Helper: wrap an artifact's add_source/add_include to prefix relative paths
+        local function wrap_artifact_methods(art, prefix)
+            local orig_art_add_source = art.add_source
+            local orig_art_add_include = art.add_include
+            local orig_art_add_include_private = art.add_include_private
+
+            art.add_source = function(self, spec)
+                if type(spec) == "string" then
+                    if not spec:match("^/") and not spec:match("^%.%./") and not spec:match("^spkg_packages/") then
+                        spec = prefix .. "/" .. spec
+                    end
+                    return orig_art_add_source(self, spec)
+                elseif type(spec) == "table" then
+                    local f = spec.file
+                    if f and not f:match("^/") and not f:match("^%.%./") and not f:match("^spkg_packages/") then
+                        spec.file = prefix .. "/" .. f
+                    end
+                    return orig_art_add_source(self, spec)
+                end
+                return orig_art_add_source(self, spec)
+            end
+
+            art.add_include = function(self, inc)
+                if inc and not inc:match("^/") and not inc:match("^%.%./") and not inc:match("^spkg_packages/") then
+                    inc = prefix .. "/" .. inc
+                end
+                return orig_art_add_include(self, inc)
+            end
+
+            art.add_include_private = function(self, inc)
+                if inc and not inc:match("^/") and not inc:match("^%.%./") and not inc:match("^spkg_packages/") then
+                    inc = prefix .. "/" .. inc
+                end
+                return orig_art_add_include_private(self, inc)
+            end
+
+            return art
+        end
+
+        -- Wrap add_* methods to return wrapped artifacts
+        b.add_executable = function(self, opts)
+            local art = orig_add_executable(self, opts)
+            return wrap_artifact_methods(art, dep_dir)
+        end
+
+        b.add_static_library = function(self, opts)
+            local art = orig_add_static_library(self, opts)
+            return wrap_artifact_methods(art, dep_dir)
+        end
+
+        b.add_shared_library = function(self, opts)
+            local art = orig_add_shared_library(self, opts)
+            return wrap_artifact_methods(art, dep_dir)
+        end
+
+        -- Load the dependency's config.spkg with the same b context.
+        -- We do NOT chdir; instead, paths are prefixed with dep_dir.
+        local abs_config = spkg.cwd() .. "/" .. config_path
+        local ok, err = pcall(dofile, abs_config)
+
+        -- Restore original methods
+        b.add_executable = orig_add_executable
+        b.add_static_library = orig_add_static_library
+        b.add_shared_library = orig_add_shared_library
+        b.dep = orig_dep
+
+        if not ok then
+            print("spkg: error: failed to load dependency '" .. name .. "' config.spkg")
+            print("  " .. tostring(err))
+            return false
+        end
+
+        if _SPKG_VERBOSE then
+            print("spkg: loaded dependency config: " .. name)
+        end
+
+        -- Recursively load transitive dependencies of this dep
+        if not load_dep_configs(b, visited) then
+            return false
+        end
+
+        ::continue::
+    end
+
+    return true
+end
+
+-- ═══════════════════════════════════════════════════════════════
 -- Parallel Distributed Compilation via curl
 -- ═══════════════════════════════════════════════════════════════
 
@@ -1533,6 +1674,9 @@ function M.execute_distributed(verbose, max_jobs)
     -- 2. Fetch dependencies (reads from b._deps)
     if not fetch_deps() then return false end
 
+    -- 2.5. Load dependency configs into the same build context
+    if not load_dep_configs(b) then return false end
+
     -- 3. Build the graph
     M.build_graph_from_ctx(b)
 
@@ -1572,7 +1716,7 @@ function M.execute_distributed(verbose, max_jobs)
     local all_tasks = {}
     for _, art in ipairs(build_graph.artifacts) do
         for _, task in ipairs(art.compile_tasks) do
-            if needs_compile(task.source, task.output, task.cflags) then
+            if needs_compile(task.source, task.output, task.cflags, task.target) then
                 spkg.mkdir_p("build/" .. art.name)
                 local source = spkg.read_file(task.source)
                 if not source then
@@ -1614,7 +1758,7 @@ function M.execute_distributed(verbose, max_jobs)
                 local task = all_tasks[ti]
                 local decoded = b64_decode(res.output)
                 spkg.write_file(task.output, decoded)
-                save_fingerprint(task.output, task.cflags)
+                save_fingerprint(task.output, task.cflags, task.target)
                 if res.depfile and res.depfile ~= "" then
                     local dep_path = task.output:sub(1, -3) .. ".d"
                     spkg.write_file(dep_path, res.depfile)
@@ -1696,7 +1840,7 @@ function M.execute_distributed(verbose, max_jobs)
                         if resp.output then
                             local decoded = b64_decode(resp.output)
                             spkg.write_file(task.output, decoded)
-                            save_fingerprint(task.output, task.cflags)
+                            save_fingerprint(task.output, task.cflags, task.target)
                             if resp.depfile and resp.depfile ~= "" then
                                 local dep_path = task.output:sub(1, -3) .. ".d"
                                 spkg.write_file(dep_path, resp.depfile)
@@ -1804,6 +1948,9 @@ function M._do_build(verbose, max_jobs)
     -- 2. Fetch dependencies (reads from b._deps)
     if not fetch_deps() then return false end
 
+    -- 2.5. Load dependency configs into the same build context
+    if not load_dep_configs(b) then return false end
+
     -- 3. Build the graph (DAG sorted)
     M.build_graph_from_ctx(b)
 
@@ -1828,7 +1975,7 @@ function M._do_build(verbose, max_jobs)
         -- Separate pending vs up-to-date tasks
         local pending_tasks = {}
         for _, task in ipairs(art.compile_tasks) do
-            if needs_compile(task.source, task.output, task.cflags) then
+            if needs_compile(task.source, task.output, task.cflags, task.target) then
                 spkg.mkdir_p("build/" .. art.name)
                 table.insert(pending_tasks, task)
             else
@@ -1935,7 +2082,7 @@ function M.execute_tests(verbose)
         -- Compile tasks
         local pending_tasks = {}
         for _, task in ipairs(art.compile_tasks) do
-            if needs_compile(task.source, task.output, task.cflags) then
+            if needs_compile(task.source, task.output, task.cflags, task.target) then
                 spkg.mkdir_p("build/" .. art.name)
                 table.insert(pending_tasks, task)
             else
