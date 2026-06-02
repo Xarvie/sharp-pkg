@@ -20,6 +20,7 @@
  *
  * Tools:
  *   spkg.find_sharpc()        → string or nil
+ *   spkg.find_sharp_std()     → string or nil
  *   spkg.find_zigcc()         → string or nil
  *   spkg.home_dir()           → string
  *   spkg.cwd()                → string
@@ -641,6 +642,77 @@ static int n_find_zigcc(lua_State *L) {
         pclose(fp);
         if (path[0] && is_executable(path)) {
             lua_pushstring(L, path); return 1;
+        }
+    }
+
+    lua_pushnil(L);
+    return 1;
+}
+
+/* ── spkg.find_sharp_std ──────────────────────────────────────────── */
+static int n_find_sharp_std(lua_State *L) {
+    /* First try SHARP_STD environment variable */
+    const char *env = getenv("SHARP_STD");
+    if (env) {
+        struct stat st;
+        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
+            lua_pushstring(L, env); return 1;
+        }
+    }
+
+    /* Derive from sharpc path: sharpc_dir/../std */
+    const char *sharpc = getenv("SHARPC");
+    char std_path[PATH_MAX];
+    if (sharpc && sharpc[0]) {
+        /* Copy sharpc path and find directory */
+        size_t len = strlen(sharpc);
+        if (len >= PATH_MAX) len = PATH_MAX - 1;
+        memcpy(std_path, sharpc, len);
+        std_path[len] = '\0';
+
+        char *slash = find_path_sep(std_path);
+        if (slash) {
+            *slash = '\0';  /* now std_path is the directory containing sharpc */
+            size_t dirlen = strlen(std_path);
+            size_t need = dirlen + 4 + 1;  /* "/../std" + NUL */
+            if (need <= PATH_MAX) {
+                memcpy(std_path + dirlen, "/../std", 7);
+                struct stat st;
+                if (stat(std_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    lua_pushstring(L, std_path); return 1;
+                }
+            }
+        }
+    }
+
+    /* Try relative to spkg executable directory */
+    char self_exe[PATH_MAX];
+    if (resolve_self_exe(self_exe, sizeof(self_exe))) {
+        char *slash = find_path_sep(self_exe);
+        if (slash) {
+            *slash = '\0';
+            size_t dirlen = strlen(self_exe);
+
+            /* Try ../sharp/std (if spkg is in sharp-pkg/spkg/build/) */
+            const char *candidates[] = {
+                "../sharp/std",
+                "../../sharp/std",
+                "std",
+                NULL
+            };
+            for (int i = 0; candidates[i]; i++) {
+                size_t clen = strlen(candidates[i]);
+                size_t need = dirlen + 1 + clen + 1;
+                if (need > PATH_MAX) continue;
+                char cand[PATH_MAX];
+                memcpy(cand, self_exe, dirlen);
+                cand[dirlen] = '/';
+                memcpy(cand + dirlen + 1, candidates[i], clen + 1);
+                struct stat st;
+                if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    lua_pushstring(L, cand); return 1;
+                }
+            }
         }
     }
 
@@ -1997,6 +2069,7 @@ static const luaL_Reg spkg_lib[] = {
     {"read_file",        n_read_file},
     {"write_file",       n_write_file},
     {"find_sharpc",      n_find_sharpc},
+    {"find_sharp_std",   n_find_sharp_std},
     {"find_zigcc",       n_find_zigcc},
     {"home_dir",         n_home_dir},
     {"cwd",              n_cwd},

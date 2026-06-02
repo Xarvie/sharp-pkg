@@ -318,6 +318,10 @@ local function create_build_context()
     end
 
     function ctx:install(art)
+        -- Deduplicate: don't install the same artifact twice
+        for _, a in ipairs(install_list) do
+            if a == art then return art end
+        end
         table.insert(install_list, art)
         return art
     end
@@ -1392,6 +1396,7 @@ local function load_dep_configs(b, visited)
         local orig_add_executable = b.add_executable
         local orig_add_static_library = b.add_static_library
         local orig_add_shared_library = b.add_shared_library
+        local orig_dep = b.dep
 
         -- Helper: wrap an artifact's add_source/add_include to prefix relative paths
         local function wrap_artifact_methods(art, prefix)
