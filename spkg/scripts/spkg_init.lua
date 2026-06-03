@@ -50,7 +50,8 @@ spkg — Sharp Package Manager
   spkg update                     update dependencies to latest
   spkg list                       list dependencies
   spkg info                       show project info and dependency tree
-  spkg clean                      remove build/, spkg_packages/, Sharp.lock
+  spkg clean                      remove build/, spkg_packages/, Sharp.lock, and global cache
+  spkg clean --keep-cache         keep global cache
   spkg cache --stats              show cache statistics
   spkg cache --clear              clear entire cache
   spkg help                       show this message
@@ -82,7 +83,7 @@ spkg — Sharp Package Manager
     elseif cmd == "info" then
         return spkg_cmd_info()
     elseif cmd == "clean" then
-        return spkg_cmd_clean()
+        return spkg_cmd_clean(args)
     elseif cmd == "test" then
         return spkg_cmd_test()
     elseif cmd == "cache" then
@@ -267,10 +268,22 @@ function spkg_cmd_info()
     return spkg_fetch.info(_SPKG_HOME, deps)
 end
 
-function spkg_cmd_clean()
+function spkg_cmd_clean(args)
     if spkg.dir_exists("build") then spkg.remove("build") end
     if spkg.dir_exists("spkg_packages") then spkg.remove("spkg_packages") end
     if spkg.file_exists("Sharp.lock") then spkg.remove("Sharp.lock") end
+    -- Clear global cache by default; --keep-cache to skip
+    local keep_cache = false
+    if args then
+        for _, a in ipairs(args) do
+            if a == "--keep-cache" then keep_cache = true end
+        end
+    end
+    if not keep_cache then
+        spkg.cache_init()
+        spkg.cache_clear()
+        print("spkg: cache cleared.")
+    end
     print("spkg: cleaned.")
     return true
 end
