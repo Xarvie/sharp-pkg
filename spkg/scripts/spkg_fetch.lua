@@ -63,7 +63,7 @@ local function resolve_dep(dep, home)
         }
     end
 
-    local default_url = "https://gitee.com/sharp-libs/{name}.git"
+    local default_url = "https://gitee.com/sharp-repo/{name}.git"
     if config and config.source and config.source["default"] then
         default_url = config.source["default"]
     end
@@ -129,6 +129,27 @@ end
 
 local fetch_from_deps_file
 
+-- 沙箱执行 config.spkg，只收集 b:dep() 调用
+-- 用 Lua 沙箱而非 regex，语义正确，能处理任意书写形式
+local function discover_deps_from_config_spkg(path)
+    local deps = {}
+    local any_func = function() return {} end
+    local sandbox_b = setmetatable({}, {
+        __index = function(_, k)
+            if k == "dep" then
+                return function(_, name, opts)
+                    table.insert(deps, { name = name, version = (opts and opts.version) or "*" })
+                end
+            end
+            return any_func
+        end
+    })
+    local env = { b = sandbox_b, spkg = spkg }
+    local chunk, _ = loadfile(path, "t", env)
+    if chunk then pcall(chunk) end
+    return deps
+end
+
 local function fetch_deps_list(deps, home, visited)
     if #deps == 0 then return true end
 
@@ -149,6 +170,17 @@ local function fetch_deps_list(deps, home, visited)
         if spkg.file_exists(dep_deps_path) then
             if not fetch_from_deps_file(dep_deps_path, home, visited) then
                 return false
+            end
+        end
+
+        -- 从 config.spkg 发现传递依赖（沙箱执行，安全且语义正确）
+        local config_path = pkg_dir .. "/config.spkg"
+        if spkg.file_exists(config_path) then
+            local config_deps = discover_deps_from_config_spkg(config_path)
+            if #config_deps > 0 then
+                if not fetch_deps_list(config_deps, home, visited) then
+                    return false
+                end
             end
         end
 

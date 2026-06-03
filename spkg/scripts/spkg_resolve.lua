@@ -29,7 +29,7 @@ function M.resolve(name, version, home)
         }
     end
 
-    local default_url = "https://gitee.com/sharp-libs/{name}.git"
+    local default_url = "https://gitee.com/sharp-repo/{name}.git"
     if config and config.source and config.source["default"] then
         default_url = config.source["default"]
     end

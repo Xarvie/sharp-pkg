@@ -393,9 +393,11 @@ local function create_build_context()
 
         local tflag = ""
         if _SPKG_TARGET and _SPKG_TARGET ~= "" then
-            tflag = " --target " .. _SPKG_TARGET
+            local zig_target = _SPKG_TARGET:gsub("%-pc%-", "-")
+            tflag = " --target " .. zig_target
         end
-        local cmd = compiler .. tflag .. " -c " .. tmpfile .. " -o /dev/null"
+        local null_dev = is_windows() and "NUL" or "/dev/null"
+        local cmd = compiler .. tflag .. " -c " .. tmpfile .. " -o " .. null_dev
         local r = spkg.run_cmd(cmd)
 
         if spkg.file_exists(tmpfile) then
@@ -619,13 +621,13 @@ function M.build_graph_from_ctx(ctx, include_tests)
 
             for _, fp in ipairs(files) do
                 local ext = fp:match("%.([^%.\\/]+)$") or ""
-                local stem = fp:gsub("%.[^%.\\/]+$", ""):gsub("[/\\]", "_")
+                local stem = fp:gsub("%.[^%.\\/]+$", ""):gsub("[/\\:]", "_")
                 local output = "build/" .. art.name .. "/" .. stem .. ".o"
                 table.insert(artifact_graph.compile_tasks, {
                     source = fp,
                     output = output,
                     cflags = src_cflags,
-                    target = cross_target or "",
+                    target = cross_target or host,
                     src_ext = ext,
                 })
             end
@@ -888,7 +890,9 @@ local function compile_task_cmd(task, verbose)
     local cflags_str = table.concat(task.cflags, " ")
     local target_flag = ""
     if task.target and task.target ~= "" then
-        target_flag = " --target " .. task.target
+        -- zig 需要 x86_64-windows-msvc 格式，而非 LLVM 的 x86_64-pc-windows-msvc
+        local zig_target = task.target:gsub("%-pc%-", "-")
+        target_flag = " --target " .. zig_target
     end
     local sysroot_flag = ""
     if _SPKG_SYSROOT and _SPKG_SYSROOT ~= "" then
@@ -956,10 +960,10 @@ local function link_artifact(artifact, verbose)
         local ar_cmd
         local zig = spkg.find_zigcc()
         if zig then
-            ar_cmd = string.format('"%s" ar rcs', zig)
+            ar_cmd = string.format('"%s" ar', zig)
         else
             -- Fallback: use system ar from PATH
-            ar_cmd = "ar rcs"
+            ar_cmd = "ar"
         end
 
         if verbose then
@@ -969,20 +973,31 @@ local function link_artifact(artifact, verbose)
         end
 
         spkg.mkdir_p("build/" .. name)
-        local inputs_list = {}
+
+        -- 用响应文件避免 Windows 命令行长度限制
+        local rsp_path = link.output .. ".rsp"
+        local rsp_lines = {}
         for _, inp in ipairs(link.inputs) do
-            table.insert(inputs_list, '"' .. inp .. '"')
+            -- 响应文件内不加引号（POSIX 风格）
+            table.insert(rsp_lines, inp)
         end
-        local inputs = table.concat(inputs_list, " ")
-        local cmd = string.format('%s "%s" %s', ar_cmd, link.output, inputs)
+        spkg.write_file(rsp_path, table.concat(rsp_lines, "\n"))
+
+        -- @响应文件不使用引号，LLVM ar 会将 @ 后面的内容作为文件名
+        local cmd = string.format('%s rcs "%s" @%s', ar_cmd, link.output, rsp_path)
         if verbose then print("    " .. cmd) end
 
         local r = spkg.run_cmd(cmd)
-        if not r then return false end
-        if not r.ok then
-            print("    ar error:\n" .. (r.out or ""))
+        if not r then
+            spkg.remove(rsp_path)
             return false
         end
+        if not r.ok then
+            print("    ar error:\n" .. (r.out or ""))
+            spkg.remove(rsp_path)
+            return false
+        end
+        spkg.remove(rsp_path)
         return true
     end
 
@@ -995,7 +1010,9 @@ local function link_artifact(artifact, verbose)
 
     local tflag = ""
     if artifact.target and artifact.target ~= "" then
-        tflag = " --target " .. artifact.target
+        -- zig 需要 x86_64-windows-msvc 格式，而非 LLVM 的 x86_64-pc-windows-msvc
+        local zig_target = artifact.target:gsub("%-pc%-", "-")
+        tflag = " --target " .. zig_target
     end
     local sysroot_flag = ""
     if _SPKG_SYSROOT and _SPKG_SYSROOT ~= "" then
@@ -1245,8 +1262,10 @@ local function scan_deps_tool(source_path, cflags, target, sysroot)
         if not zig then return nil end
         local args = { zig, "cc", "-MM", "-MG" }
         if target and target ~= "" then
+            -- zig 需要 x86_64-windows-gnu 格式，而非 LLVM 的 x86_64-pc-windows-gnu
+            local zig_target = target:gsub("%-pc%-", "-")
             table.insert(args, "-target")
-            table.insert(args, target)
+            table.insert(args, zig_target)
         end
         if sysroot and sysroot ~= "" then
             table.insert(args, "--sysroot")
@@ -1255,7 +1274,8 @@ local function scan_deps_tool(source_path, cflags, target, sysroot)
         for _, f in ipairs(cflags) do table.insert(args, f) end
         table.insert(args, source_path)
         local cmd = table.concat(args, " ")
-        local r = spkg.run_cmd(cmd .. " 2>/dev/null")
+        local null_redir = is_windows() and " 2>nul" or " 2>/dev/null"
+        local r = spkg.run_cmd(cmd .. null_redir)
         if not r or not r.ok or not r.out then return nil end
         return parse_depfile_output(r.out, cflags)
     end
@@ -1396,15 +1416,21 @@ local function load_dep_configs(b, visited)
             local orig_art_add_include = art.add_include
             local orig_art_add_include_private = art.add_include_private
 
+            local function is_absolute_path(p)
+                -- Unix: starts with /
+                -- Windows: starts with drive letter followed by :/ or :\
+                return p:match("^/") or p:match("^%a:[/\\]")
+            end
+
             art.add_source = function(self, spec)
                 if type(spec) == "string" then
-                    if not spec:match("^/") and not spec:match("^%.%./") and not spec:match("^spkg_packages/") then
+                    if not is_absolute_path(spec) and not spec:match("^spkg_packages/") then
                         spec = prefix .. "/" .. spec
                     end
                     return orig_art_add_source(self, spec)
                 elseif type(spec) == "table" then
                     local f = spec.file
-                    if f and not f:match("^/") and not f:match("^%.%./") and not f:match("^spkg_packages/") then
+                    if f and not is_absolute_path(f) and not f:match("^spkg_packages/") then
                         spec.file = prefix .. "/" .. f
                     end
                     return orig_art_add_source(self, spec)
@@ -1413,14 +1439,14 @@ local function load_dep_configs(b, visited)
             end
 
             art.add_include = function(self, inc)
-                if inc and not inc:match("^/") and not inc:match("^%.%./") and not inc:match("^spkg_packages/") then
+                if inc and not is_absolute_path(inc) and not inc:match("^spkg_packages/") then
                     inc = prefix .. "/" .. inc
                 end
                 return orig_art_add_include(self, inc)
             end
 
             art.add_include_private = function(self, inc)
-                if inc and not inc:match("^/") and not inc:match("^%.%./") and not inc:match("^spkg_packages/") then
+                if inc and not is_absolute_path(inc) and not inc:match("^spkg_packages/") then
                     inc = prefix .. "/" .. inc
                 end
                 return orig_art_add_include_private(self, inc)
@@ -1484,19 +1510,37 @@ end
 local _curl_avail = nil
 local function curl_available()
     if _curl_avail == nil then
-        local r = spkg.run_cmd("curl --version 2>/dev/null")
+        local null_redir = is_windows() and "2>nul" or "2>/dev/null"
+        local r = spkg.run_cmd("curl --version " .. null_redir)
         _curl_avail = (r and r.ok)
     end
     return _curl_avail
 end
 
+-- Platform-aware sleep (Windows: ping trick; POSIX: sleep)
+local function _platform_sleep(seconds)
+    if seconds <= 0 then return end
+    if is_windows() then
+        -- Windows: ping -n N+1 127.0.0.1 >nul (ping waits ~1s between pings)
+        local n = math.max(1, math.ceil(seconds))
+        spkg.run_cmd("ping -n " .. (n + 1) .. " 127.0.0.1 >nul")
+    else
+        spkg.run_cmd("sleep " .. seconds)
+    end
+end
+
 local _curl_tmp_id = 0
 local function _curl_tmp_name(prefix)
     _curl_tmp_id = _curl_tmp_id + 1
-    return "/tmp/spkg_" .. prefix .. "_" .. tostring(_curl_tmp_id)
+    if is_windows() then
+        local tmp = os.getenv("TEMP") or os.getenv("TMP") or "."
+        return tmp .. "/spkg_" .. prefix .. "_" .. tostring(_curl_tmp_id)
+    else
+        return "/tmp/spkg_" .. prefix .. "_" .. tostring(_curl_tmp_id)
+    end
 end
 
-local function _build_compile_json(source, cflags, headers, opt, src_ext)
+local function _build_compile_json(source, cflags, headers, opt, src_ext, target)
     local cflags_json = "["
     for i, f in ipairs(cflags) do
         if i > 1 then cflags_json = cflags_json .. "," end
@@ -1516,9 +1560,15 @@ local function _build_compile_json(source, cflags, headers, opt, src_ext)
         headers_json = headers_json .. string.format('{"path":"%s","content":"%s"}', hpath, he)
     end
 
+    local target_str = ""
+    if target and target ~= "" then
+        local zig_target = target:gsub("%-pc%-", "-")
+        target_str = string.format(',"target":"%s"', zig_target)
+    end
+
     return string.format(
-        '{"source":"%s","cflags":%s,"optimize":"%s","headers":[%s],"src_ext":"%s"}',
-        escaped, cflags_json, opt, headers_json, src_ext)
+        '{"source":"%s","cflags":%s,"optimize":"%s","headers":[%s],"src_ext":"%s"%s}',
+        escaped, cflags_json, opt, headers_json, src_ext, target_str)
 end
 
 local function _distribute_parallel(task_list, healthy_nodes, verbose)
@@ -1527,11 +1577,12 @@ local function _distribute_parallel(task_list, healthy_nodes, verbose)
     local pending = {}
     local tmp_req_files = {}
     local tmp_out_files = {}
+    local null_redir = is_windows() and "2>nul" or "2>/dev/null"
 
     -- Phase 1: submit all tasks
     for ti, entry in ipairs(task_list) do
         local node = healthy_nodes[((ti - 1) % NH) + 1]
-        local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext)
+        local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext, entry.target)
 
         local req_file = _curl_tmp_name("req")
         local out_file = _curl_tmp_name("resp")
@@ -1541,8 +1592,8 @@ local function _distribute_parallel(task_list, healthy_nodes, verbose)
 
         local url = "http://" .. node .. "/compile"
         local cmd = string.format(
-            'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s 2>/dev/null',
-            req_file, out_file, url)
+            'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s %s',
+            req_file, out_file, url, null_redir)
 
         if verbose then
             print("  [remote] " .. entry.source_path .. " -> " .. node)
@@ -1601,12 +1652,12 @@ local function _distribute_parallel(task_list, healthy_nodes, verbose)
                  elseif p.attempt < NH then
                      if p.attempt > 1 then
                          local delay_ms = math.min(100 * (2 ^ (p.attempt - 2)), 5000)
-                         spkg.run_cmd("sleep " .. (delay_ms / 1000))
+                         _platform_sleep(delay_ms / 1000)
                      end
 
                      local next_node = healthy_nodes[((p.task_idx - 1 + p.attempt) % NH) + 1]
                      local entry = task_list[p.task_idx]
-                     local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext)
+                     local req_json = _build_compile_json(entry.source, entry.cflags, entry.headers or {}, entry.opt, entry.src_ext, entry.target)
 
                      local retry_req = _curl_tmp_name("req_retry")
                      local retry_out = _curl_tmp_name("resp_retry")
@@ -1617,8 +1668,8 @@ local function _distribute_parallel(task_list, healthy_nodes, verbose)
 
                      local url = "http://" .. next_node .. "/compile"
                      local cmd = string.format(
-                         'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s 2>/dev/null',
-                         retry_req, retry_out, url)
+                         'curl -s -X POST --data-binary @%s -o %s --max-time 300 %s %s',
+                         retry_req, retry_out, url, null_redir)
 
                     if verbose then
                         print("    [retry] " .. entry.source_path .. " -> " .. next_node .. " (" .. (err_msg or "failed") .. ")")
@@ -1635,7 +1686,7 @@ local function _distribute_parallel(task_list, healthy_nodes, verbose)
         end
         pending = still_pending
         if #pending > 0 then
-            spkg.run_cmd("sleep 0.1")
+            _platform_sleep(0.1)
         end
     end
 
@@ -1727,6 +1778,7 @@ function M.execute_distributed(verbose, max_jobs)
                     headers = headers,
                     opt = _SPKG_OPTIMIZE or "Debug",
                     src_ext = task.src_ext or "ce",
+                    target = task.target or "",
                     source_path = task.source,
                     output = task.output,
                     artifact_name = art.name,
@@ -1778,7 +1830,7 @@ function M.execute_distributed(verbose, max_jobs)
             for attempt = 1, #healthy do
                 if attempt > 1 then
                     local delay_ms = math.min(100 * (2 ^ (attempt - 2)), 5000)
-                    spkg.run_cmd("sleep " .. (delay_ms / 1000))
+                    _platform_sleep(delay_ms / 1000)
                 end
 
                 local try_idx = nil
@@ -1794,7 +1846,7 @@ function M.execute_distributed(verbose, max_jobs)
                 if not try_idx then break end
 
                 local node = healthy[try_idx]
-                local req = _build_compile_json(task.source, task.cflags, task.headers or {}, task.opt, task.src_ext)
+                local req = _build_compile_json(task.source, task.cflags, task.headers or {}, task.opt, task.src_ext, task.target)
 
                 if verbose then
                     local tag = (attempt == 1) and "remote" or "retry"

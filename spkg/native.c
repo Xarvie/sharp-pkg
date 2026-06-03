@@ -97,6 +97,13 @@ static char *find_path_sep(char *path) {
     return last;
 }
 
+/* 路径归一化：\ → /（Windows 下统一为 /） */
+static void normalize_path_sep(char *path) {
+    for (char *p = path; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+}
+
 #ifndef _WIN32
 static int mkdir_p_native(const char *path) {
     struct stat st;
@@ -164,6 +171,84 @@ static int remove_recursive(const char *path) {
 #endif
 
 /* ── spkg.run_cmd ────────────────────────────────────────────────── */
+#ifdef _WIN32
+static int n_run_cmd(lua_State *L) {
+    const char *cmd = luaL_checkstring(L, 1);
+    int code = -1;
+    char *out = NULL;
+    size_t total = 0;
+
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) goto done;
+
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    {
+        char cmd_copy[32768];
+        strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1);
+        cmd_copy[sizeof(cmd_copy) - 1] = '\0';
+
+        PROCESS_INFORMATION pi = {0};
+        STARTUPINFOA si = { sizeof(STARTUPINFOA) };
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = hWritePipe;
+        si.hStdError  = hWritePipe;
+        si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+
+        BOOL created = CreateProcessA(
+            NULL, cmd_copy, NULL, NULL, TRUE,
+            CREATE_NO_WINDOW, NULL, NULL, &si, &pi
+        );
+
+        CloseHandle(hWritePipe);
+        hWritePipe = NULL;
+
+        if (created) {
+            CloseHandle(pi.hThread);
+
+            out = malloc(1);
+            if (out) {
+                out[0] = '\0';
+                char buf[4096];
+                DWORD bread;
+                while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bread, NULL) && bread > 0) {
+                    buf[bread] = '\0';
+                    size_t n = strlen(buf);
+                    char *tmp = realloc(out, total + n + 1);
+                    if (!tmp) { free(out); out = NULL; break; }
+                    out = tmp;
+                    memcpy(out + total, buf, n);
+                    total += n;
+                    out[total] = '\0';
+                }
+            }
+
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            DWORD exit_code;
+            GetExitCodeProcess(pi.hProcess, &exit_code);
+            code = (int)exit_code;
+            CloseHandle(pi.hProcess);
+        }
+    }
+
+done:
+    if (hReadPipe) CloseHandle(hReadPipe);
+    if (hWritePipe) CloseHandle(hWritePipe);
+
+    lua_newtable(L);
+    lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
+    if (code == -1 && !out) {
+        lua_pushliteral(L, "CreateProcess failed"); lua_setfield(L, -2, "out");
+    } else {
+        lua_pushstring(L, out ? out : ""); lua_setfield(L, -2, "out");
+    }
+    lua_pushinteger(L, code); lua_setfield(L, -2, "code");
+
+    free(out);
+    return 1;
+}
+#else
 static int n_run_cmd(lua_State *L) {
     const char *cmd = luaL_checkstring(L, 1);
     FILE *fp = popen(cmd, "r");
@@ -199,11 +284,7 @@ static int n_run_cmd(lua_State *L) {
     }
 
     int status = pclose(fp);
-#ifdef _WIN32
-    int code = status;
-#else
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-#endif
 
     lua_newtable(L);
     lua_pushboolean(L, code == 0); lua_setfield(L, -2, "ok");
@@ -213,6 +294,7 @@ static int n_run_cmd(lua_State *L) {
     free(out);
     return 1;
 }
+#endif
 
 /* ── spkg.file_exists ────────────────────────────────────────────── */
 static int n_file_exists(lua_State *L) {
@@ -436,7 +518,8 @@ static int n_find_sharpc(lua_State *L) {
     if (root && root[0]) {
         char cand[PATH_MAX];
 #ifdef _WIN32
-        snprintf(cand, sizeof(cand), "%s\\bin\\sharpc.exe", root);
+        snprintf(cand, sizeof(cand), "%s/bin/sharpc.exe", root);
+        normalize_path_sep(cand);
 #else
         snprintf(cand, sizeof(cand), "%s/bin/sharpc", root);
 #endif
@@ -452,7 +535,8 @@ static int n_find_zigcc(lua_State *L) {
     if (root && root[0]) {
         char cand[PATH_MAX];
 #ifdef _WIN32
-        snprintf(cand, sizeof(cand), "%s\\zig\\zig.exe", root);
+        snprintf(cand, sizeof(cand), "%s/zig/zig.exe", root);
+        normalize_path_sep(cand);
 #else
         snprintf(cand, sizeof(cand), "%s/zig/zig", root);
 #endif
@@ -468,7 +552,8 @@ static int n_find_sharp_std(lua_State *L) {
     if (root && root[0]) {
         char cand[PATH_MAX];
 #ifdef _WIN32
-        snprintf(cand, sizeof(cand), "%s\\std", root);
+        snprintf(cand, sizeof(cand), "%s/std", root);
+        normalize_path_sep(cand);
         DWORD attr = GetFileAttributesA(cand);
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
             lua_pushstring(L, cand); return 1;
@@ -497,7 +582,17 @@ static int n_home_dir(lua_State *L) {
         h = pw ? pw->pw_dir : "/";
     }
 #endif
+#ifdef _WIN32
+    {
+        char home_buf[PATH_MAX];
+        strncpy(home_buf, h, sizeof(home_buf) - 1);
+        home_buf[sizeof(home_buf) - 1] = '\0';
+        normalize_path_sep(home_buf);
+        lua_pushstring(L, home_buf);
+    }
+#else
     lua_pushstring(L, h);
+#endif
     return 1;
 }
 
@@ -505,9 +600,10 @@ static int n_home_dir(lua_State *L) {
 static int n_cwd(lua_State *L) {
     char buf[PATH_MAX];
 #ifdef _WIN32
-    if (_getcwd(buf, sizeof(buf)))
+    if (_getcwd(buf, sizeof(buf))) {
+        normalize_path_sep(buf);
         lua_pushstring(L, buf);
-    else
+    } else
         lua_pushstring(L, ".");
 #else
     if (getcwd(buf, sizeof(buf)))
@@ -602,9 +698,9 @@ static int n_current_platform(lua_State *L) {
     #endif
 #elif defined(_WIN32)
     #if defined(_M_ARM64) || defined(__aarch64__)
-        lua_pushstring(L, "arm64-pc-windows-msvc");
+        lua_pushstring(L, "arm64-pc-windows-gnu");
     #else
-        lua_pushstring(L, "x86_64-pc-windows-msvc");
+        lua_pushstring(L, "x86_64-pc-windows-gnu");
     #endif
 #else
     lua_pushstring(L, "unknown");

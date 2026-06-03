@@ -87,6 +87,11 @@ SPKG_SOURCES = [
     "mongoose.c",
 ]
 
+NODE_SOURCES = [
+    "node.c",
+    "mongoose.c",
+]
+
 CFLAGS = [
     "-std=c99",
     "-O2",
@@ -212,6 +217,30 @@ def build_spkg():
     return exe
 
 
+def build_node():
+    """Build spkg-node — the distributed compilation server."""
+    print("[build] spkg-node")
+
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    objs = []
+    for src in NODE_SOURCES:
+        objs.append(compile_obj(src))
+
+    name = "spkg-node" + EXE_EXT
+    extra_flags = None
+    if _SYS == "win32":
+        extra_flags = ["-lws2_32", "-static"]
+    else:
+        extra_flags = ["-lpthread"]
+
+    link_exe(objs, name, extra_flags=extra_flags)
+    exe = BUILD_DIR / name
+    deploy_to_env(exe)
+    return exe
+
+
 if __name__ == "__main__":
     build_spkg()
+    build_node()
     print("[build] all done.")
