@@ -53,7 +53,14 @@ endif()
 
 set(LIBGIT2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libgit2")
 
-if(EXISTS "${LIBGIT2_DIR}/build/libgit2.a")
+if(WIN32 AND EXISTS "${LIBGIT2_DIR}/build/src/libgit2/libgit2.dir/Release/libgit2.lib")
+    add_library(libgit2_static STATIC IMPORTED)
+    set_target_properties(libgit2_static PROPERTIES
+        IMPORTED_LOCATION "${LIBGIT2_DIR}/build/src/libgit2/libgit2.dir/Release/libgit2.lib"
+    )
+    set(LIBGIT2_INCLUDES "${LIBGIT2_DIR}/include")
+    set(LIBGIT2_LIBS libgit2_static)
+elseif(EXISTS "${LIBGIT2_DIR}/build/libgit2.a")
     message(STATUS "Found libgit2 at ${LIBGIT2_DIR}/build")
     add_library(libgit2_static STATIC IMPORTED)
     set_target_properties(libgit2_static PROPERTIES
@@ -85,6 +92,10 @@ target_include_directories(spkg PRIVATE
 )
 
 target_link_libraries(spkg PRIVATE lua54 ${LIBGIT2_LIBS})
+
+if(WIN32)
+    target_link_libraries(spkg PRIVATE ws2_32 winhttp rpcrt4 crypt32 secur32 shlwapi)
+endif()
 
 if(UNIX)
     target_link_libraries(spkg PRIVATE pthread)

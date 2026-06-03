@@ -47,6 +47,7 @@
     #include <windows.h>
     #include <io.h>
     #include <direct.h>
+    #include <sys/stat.h>
     #define PATH_SEP '\\'
     #define PATH_SEP_STR "\\"
     #ifndef PATH_MAX
