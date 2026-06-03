@@ -91,6 +91,7 @@ CFLAGS = [
     "-std=c99",
     "-O2",
     "-Wall", "-Wextra", "-Wno-deprecated-declarations",
+    "-D_GNU_SOURCE",
     "-DNDEBUG",
     "-target", TARGET,
     "-I", str(ROOT),
@@ -170,6 +171,20 @@ def deploy_to_env(exe_path):
     print(f"  CP {exe_path.name} -> {dst}")
 
 
+def deploy_lua_scripts():
+    dst_dir = _SHARP_ROOT / "share" / "spkg"
+    if not dst_dir.is_dir():
+        dst_dir.mkdir(parents=True, exist_ok=True)
+    for script_rel in LUA_SCRIPTS:
+        src = ROOT / script_rel
+        if not src.is_file():
+            print(f"  SKIP {script_rel} (not found)")
+            continue
+        dst = dst_dir / src.name
+        shutil.copy2(str(src), str(dst))
+        print(f"  CP {src.name} -> {dst}")
+
+
 def build_spkg():
     print("[build] spkg")
 
@@ -193,6 +208,7 @@ def build_spkg():
     link_exe(objs, name)
     exe = BUILD_DIR / name
     deploy_to_env(exe)
+    deploy_lua_scripts()
     return exe
 
 

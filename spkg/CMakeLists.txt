@@ -106,6 +106,7 @@ if(DEFINED ENV{SHARP_ROOT} AND NOT DEFINED CMAKE_INSTALL_PREFIX)
   set(CMAKE_INSTALL_PREFIX "$ENV{SHARP_ROOT}")
 endif()
 install(TARGETS spkg RUNTIME DESTINATION bin)
+install(DIRECTORY scripts/ DESTINATION share/spkg FILES_MATCHING PATTERN "*.lua")
 
 # ── 5. spkg-node executable ─────────────────────────────────────────
 
