@@ -1812,6 +1812,12 @@ function M.execute_distributed(verbose, max_jobs)
                     local dep_path = task.output:sub(1, -3) .. ".d"
                     spkg.write_file(dep_path, res.depfile)
                 end
+                -- Save to global cache
+                if not _SPKG_NO_CACHE then
+                    spkg.cache_init()
+                    local cache_key = cache_key_for({ cflags = task.cflags, target = task.target, source = task.source_path })
+                    spkg.cache_put(cache_key, task.output)
+                end
             else
                 print("  error: " .. (res.error or "unknown"))
                 return false
@@ -1893,6 +1899,12 @@ function M.execute_distributed(verbose, max_jobs)
                             if resp.depfile and resp.depfile ~= "" then
                                 local dep_path = task.output:sub(1, -3) .. ".d"
                                 spkg.write_file(dep_path, resp.depfile)
+                            end
+                            -- Save to global cache
+                            if not _SPKG_NO_CACHE then
+                                spkg.cache_init()
+                                local cache_key = cache_key_for({ cflags = task.cflags, target = task.target, source = task.source_path })
+                                spkg.cache_put(cache_key, task.output)
                             end
                             task_ok = true
                             node_idx = try_idx
