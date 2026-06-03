@@ -916,7 +916,7 @@ local function compile_task(task, verbose)
 
     local cmd = compile_task_cmd(task, verbose)
     if not cmd then
-        print("spkg: no compiler found. Install sharpc or set SHARPC env var.")
+        print("spkg: no compiler found. Set SHARP_ROOT env var or install sharpc.")
         return false
     end
 

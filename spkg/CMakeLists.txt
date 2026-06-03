@@ -90,8 +90,10 @@ if(UNIX)
     target_link_libraries(spkg PRIVATE pthread)
 endif()
 
-# ── install ───────────────────────────────────────────────────────────
-
+# ── Install to $ENV{SHARP_ROOT}/bin if set, otherwise use cmake default ────
+if(DEFINED ENV{SHARP_ROOT} AND NOT DEFINED CMAKE_INSTALL_PREFIX)
+  set(CMAKE_INSTALL_PREFIX "$ENV{SHARP_ROOT}")
+endif()
 install(TARGETS spkg RUNTIME DESTINATION bin)
 
 # ── 5. spkg-node executable ─────────────────────────────────────────

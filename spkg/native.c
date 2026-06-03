@@ -88,32 +88,6 @@ static int is_executable(const char *path) {
 #endif
 }
 
-/* Resolve own exe path into buf */
-static const char *resolve_self_exe(char *buf, size_t bufsize) {
-#if defined(__linux__)
-    ssize_t n = readlink("/proc/self/exe", buf, bufsize - 1);
-    if (n < 0) return NULL;
-    buf[n] = '\0';
-    return buf;
-#elif defined(__APPLE__)
-    uint32_t size = bufsize > UINT32_MAX ? UINT32_MAX : (uint32_t)bufsize;
-    if (_NSGetExecutablePath(buf, &size) != 0) return NULL;
-    char tmp[PATH_MAX];
-    char *real = realpath(buf, tmp);
-    if (real) {
-        memcpy(buf, real, strlen(real) + 1);
-    }
-    return buf;
-#elif defined(_WIN32)
-    DWORD len = GetModuleFileNameA(NULL, buf, (DWORD)bufsize);
-    if (len == 0 || len >= bufsize) return NULL;
-    return buf;
-#else
-    (void)buf; (void)bufsize;
-    return NULL;
-#endif
-}
-
 /* Find path separator (handles both / and \) */
 static char *find_path_sep(char *path) {
     char *last = NULL;
@@ -121,81 +95,6 @@ static char *find_path_sep(char *path) {
         if (*p == '/' || *p == '\\') last = p;
     }
     return last;
-}
-
-/* Try to find zig relative to self-exe, following sharp's layout */
-static const char *find_zig_near_exe(void) {
-    static char zig_path[PATH_MAX];
-    char self_exe[PATH_MAX];
-    if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
-
-    char *slash = find_path_sep(self_exe);
-    if (!slash) return NULL;
-    *slash = '\0';
-    size_t dirlen = strlen(self_exe);
-
-#ifdef _WIN32
-    const char *zig_name = "zig.exe";
-#else
-    const char *zig_name = "zig";
-#endif
-
-    if (dirlen + 1 + strlen(zig_name) < sizeof(zig_path)) {
-        memcpy(zig_path, self_exe, dirlen);
-        zig_path[dirlen] = PATH_SEP;
-        size_t zlen = strlen(zig_name);
-        memcpy(zig_path + dirlen + 1, zig_name, zlen + 1);
-        if (is_executable(zig_path)) return zig_path;
-    }
-
-    {
-        char *parent_sep = find_path_sep(self_exe);
-        if (parent_sep) {
-            size_t pdirlen = (size_t)(parent_sep - self_exe);
-#ifdef _WIN32
-            const char *rel = "zig\\zig.exe";
-            size_t rel_len = 13;
-#else
-            const char *rel = "zig/zig";
-            size_t rel_len = 7;
-#endif
-            size_t need = pdirlen + 1 + rel_len + 1;
-            if (need < sizeof(zig_path)) {
-                memcpy(zig_path, self_exe, pdirlen);
-                zig_path[pdirlen] = PATH_SEP;
-                memcpy(zig_path + pdirlen + 1, rel, rel_len + 1);
-                if (is_executable(zig_path)) return zig_path;
-            }
-        }
-    }
-
-    {
-        char dir[PATH_MAX];
-        memcpy(dir, self_exe, dirlen);
-        dir[dirlen] = '\0';
-        for (int depth = 0; depth < 6; depth++) {
-            char *sep = find_path_sep(dir);
-            if (!sep) break;
-            size_t plen = (size_t)(sep - dir);
-#ifdef _WIN32
-            const char *rel = "zig\\zig.exe";
-            size_t rel_len = 13;
-#else
-            const char *rel = "zig/zig";
-            size_t rel_len = 7;
-#endif
-            size_t need = plen + 1 + rel_len + 1;
-            if (need < sizeof(zig_path)) {
-                memcpy(zig_path, dir, plen);
-                zig_path[plen] = PATH_SEP;
-                memcpy(zig_path + plen + 1, rel, rel_len + 1);
-                if (is_executable(zig_path)) return zig_path;
-            }
-            dir[plen] = '\0';
-        }
-    }
-
-    return NULL;
 }
 
 #ifndef _WIN32
@@ -533,189 +432,51 @@ static int n_write_file(lua_State *L) {
 
 /* ── spkg.find_sharpc ────────────────────────────────────────────── */
 static int n_find_sharpc(lua_State *L) {
-    const char *env = getenv("SHARPC");
-    if (env && is_executable(env)) {
-        lua_pushstring(L, env); return 1;
-    }
-
-    char self_exe[PATH_MAX];
-    char cand[PATH_MAX];
-    if (resolve_self_exe(self_exe, sizeof(self_exe))) {
-        char *slash = find_path_sep(self_exe);
-        if (slash) *slash = '\0';
-        size_t dirlen = strlen(self_exe);
-
+    const char *root = getenv("SHARP_ROOT");
+    if (root && root[0]) {
+        char cand[PATH_MAX];
 #ifdef _WIN32
-        const char *rel[] = {
-            "sharpc.exe",
-            "..\\sharpc.exe",
-            NULL
-        };
+        snprintf(cand, sizeof(cand), "%s\\bin\\sharpc.exe", root);
 #else
-        const char *rel[] = {
-            "sharpc",
-            "../sharpc",
-            NULL
-        };
+        snprintf(cand, sizeof(cand), "%s/bin/sharpc", root);
 #endif
-        for (int i = 0; rel[i]; i++) {
-            size_t rlen = strlen(rel[i]);
-            size_t need = dirlen + 1 + rlen + 1;
-            if (need > PATH_MAX) continue;
-            memcpy(cand, self_exe, dirlen);
-            cand[dirlen] = '/';
-            memcpy(cand + dirlen + 1, rel[i], rlen + 1);
-#ifdef _WIN32
-            for (size_t j = dirlen; j < need - 1; j++) {
-                if (cand[j] == '/') cand[j] = '\\';
-            }
-#endif
-            if (is_executable(cand)) {
-                lua_pushstring(L, cand); return 1;
-            }
-        }
-
-        {
-            char dir[PATH_MAX];
-            memcpy(dir, self_exe, dirlen);
-            dir[dirlen] = '\0';
-            for (int depth = 0; depth < 6; depth++) {
-                char *sep = find_path_sep(dir);
-                if (!sep) break;
-                size_t plen = (size_t)(sep - dir);
-#ifdef _WIN32
-                const char *rel2[] = {
-                    "bin\\sharpc.exe",
-                    "sharpc.exe",
-                    NULL
-                };
-#else
-                const char *rel2[] = {
-                    "bin/sharpc",
-                    "sharpc",
-                    NULL
-                };
-#endif
-                for (int j = 0; rel2[j]; j++) {
-                    size_t rlen = strlen(rel2[j]);
-                    size_t need = plen + 1 + rlen + 1;
-                    if (need > PATH_MAX) continue;
-                    memcpy(cand, dir, plen);
-                    cand[plen] = PATH_SEP;
-                    memcpy(cand + plen + 1, rel2[j], rlen + 1);
-                    if (is_executable(cand)) {
-                        lua_pushstring(L, cand); return 1;
-                    }
-                }
-                dir[plen] = '\0';
-            }
-        }
+        if (is_executable(cand)) { lua_pushstring(L, cand); return 1; }
     }
-
     lua_pushnil(L);
     return 1;
 }
 
 /* ── spkg.find_zigcc ─────────────────────────────────────────────── */
 static int n_find_zigcc(lua_State *L) {
-    const char *env = getenv("ZIGCC");
-    if (env && is_executable(env)) {
-        lua_pushstring(L, env); return 1;
-    }
-
-    const char *found = find_zig_near_exe();
-    if (found) {
-        lua_pushstring(L, found); return 1;
-    }
-
+    const char *root = getenv("SHARP_ROOT");
+    if (root && root[0]) {
+        char cand[PATH_MAX];
 #ifdef _WIN32
-    FILE *fp = popen("where zig.exe 2>nul", "r");
+        snprintf(cand, sizeof(cand), "%s\\zig\\zig.exe", root);
 #else
-    FILE *fp = popen("which zig 2>/dev/null", "r");
+        snprintf(cand, sizeof(cand), "%s/zig/zig", root);
 #endif
-    if (fp) {
-        char path[PATH_MAX] = "";
-        if (fgets(path, sizeof(path), fp)) {
-            size_t n = strlen(path);
-            while (n > 0 && (path[n-1] == '\n' || path[n-1] == '\r')) path[--n] = '\0';
-        }
-        pclose(fp);
-        if (path[0] && is_executable(path)) {
-            lua_pushstring(L, path); return 1;
-        }
+        if (is_executable(cand)) { lua_pushstring(L, cand); return 1; }
     }
-
     lua_pushnil(L);
     return 1;
 }
 
 /* ── spkg.find_sharp_std ──────────────────────────────────────────── */
 static int n_find_sharp_std(lua_State *L) {
-    /* First try SHARP_STD environment variable */
-    const char *env = getenv("SHARP_STD");
-    if (env) {
+    const char *root = getenv("SHARP_ROOT");
+    if (root && root[0]) {
+        char cand[PATH_MAX];
+#ifdef _WIN32
+        snprintf(cand, sizeof(cand), "%s\\std", root);
+#else
+        snprintf(cand, sizeof(cand), "%s/std", root);
+#endif
         struct stat st;
-        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
-            lua_pushstring(L, env); return 1;
+        if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+            lua_pushstring(L, cand); return 1;
         }
     }
-
-    /* Derive from sharpc path: sharpc_dir/../std */
-    const char *sharpc = getenv("SHARPC");
-    char std_path[PATH_MAX];
-    if (sharpc && sharpc[0]) {
-        /* Copy sharpc path and find directory */
-        size_t len = strlen(sharpc);
-        if (len >= PATH_MAX) len = PATH_MAX - 1;
-        memcpy(std_path, sharpc, len);
-        std_path[len] = '\0';
-
-        char *slash = find_path_sep(std_path);
-        if (slash) {
-            *slash = '\0';  /* now std_path is the directory containing sharpc */
-            size_t dirlen = strlen(std_path);
-            size_t need = dirlen + 4 + 1;  /* "/../std" + NUL */
-            if (need <= PATH_MAX) {
-                memcpy(std_path + dirlen, "/../std", 7);
-                struct stat st;
-                if (stat(std_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    lua_pushstring(L, std_path); return 1;
-                }
-            }
-        }
-    }
-
-    /* Try relative to spkg executable directory */
-    char self_exe[PATH_MAX];
-    if (resolve_self_exe(self_exe, sizeof(self_exe))) {
-        char *slash = find_path_sep(self_exe);
-        if (slash) {
-            *slash = '\0';
-            size_t dirlen = strlen(self_exe);
-
-            /* Try ../sharp/std (if spkg is in sharp-pkg/spkg/build/) */
-            const char *candidates[] = {
-                "../sharp/std",
-                "../../sharp/std",
-                "std",
-                NULL
-            };
-            for (int i = 0; candidates[i]; i++) {
-                size_t clen = strlen(candidates[i]);
-                size_t need = dirlen + 1 + clen + 1;
-                if (need > PATH_MAX) continue;
-                char cand[PATH_MAX];
-                memcpy(cand, self_exe, dirlen);
-                cand[dirlen] = '/';
-                memcpy(cand + dirlen + 1, candidates[i], clen + 1);
-                struct stat st;
-                if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    lua_pushstring(L, cand); return 1;
-                }
-            }
-        }
-    }
-
     lua_pushnil(L);
     return 1;
 }

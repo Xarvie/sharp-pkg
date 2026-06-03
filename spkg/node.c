@@ -35,48 +35,16 @@ static int is_executable(const char *path) {
     return access(path, X_OK) == 0;
 }
 
-static int resolve_self_exe(char *buf, size_t sz) {
-#ifdef __linux__
-    ssize_t n = readlink("/proc/self/exe", buf, sz - 1);
-    if (n > 0) { buf[n] = '\0'; return 1; }
-#elif defined(__APPLE__)
-    uint32_t n = sz > UINT32_MAX ? UINT32_MAX : (uint32_t)sz;
-    if (_NSGetExecutablePath(buf, &n) == 0) return 1;
-#else
-    (void)buf; (void)sz;
-#endif
-    return 0;
-}
-
-/* Try to find sharpc relative to node binary */
+/* Find sharpc from SHARP_ROOT */
 static const char *find_sharpc_path(char *buf, size_t sz) {
-    const char *env = getenv("SHARPC");
-    if (env && is_executable(env)) return env;
-
-    char self_exe[PATH_MAX];
-    if (!resolve_self_exe(self_exe, sizeof(self_exe))) return NULL;
-
-    char *slash = strrchr(self_exe, '/');
-    if (!slash) return NULL;
-    *slash = '\0';
-    size_t dirlen = strlen(self_exe);
-
-    const char *rel[] = {
-        "../../sharpc/bin/sharpc",
-        "../../../build/sharpc",
-        "../../build/sharpc",
-        "../build/sharpc",
-        "../sharpc",
-        NULL
-    };
-    for (int i = 0; rel[i]; i++) {
-        size_t rlen = strlen(rel[i]);
-        size_t need = dirlen + 1 + rlen + 1;
-        if (need > sz) continue;
-        memcpy(buf, self_exe, dirlen);
-        buf[dirlen] = '/';
-        memcpy(buf + dirlen + 1, rel[i], rlen + 1);
-        if (is_executable(buf)) return buf;
+    const char *root = getenv("SHARP_ROOT");
+    if (root && root[0]) {
+        size_t need = strlen(root) + 13; /* "/bin/sharpc" + NUL */
+        if (need <= sz) {
+            memcpy(buf, root, strlen(root));
+            memcpy(buf + strlen(root), "/bin/sharpc", 13);
+            if (is_executable(buf)) return buf;
+        }
     }
     return NULL;
 }
