@@ -47,7 +47,6 @@
     #include <windows.h>
     #include <io.h>
     #include <direct.h>
-    #include <sys/stat.h>
     #define PATH_SEP '\\'
     #define PATH_SEP_STR "\\"
     #ifndef PATH_MAX
@@ -470,13 +469,17 @@ static int n_find_sharp_std(lua_State *L) {
         char cand[PATH_MAX];
 #ifdef _WIN32
         snprintf(cand, sizeof(cand), "%s\\std", root);
+        DWORD attr = GetFileAttributesA(cand);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            lua_pushstring(L, cand); return 1;
+        }
 #else
         snprintf(cand, sizeof(cand), "%s/std", root);
-#endif
         struct stat st;
         if (stat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
             lua_pushstring(L, cand); return 1;
         }
+#endif
     }
     lua_pushnil(L);
     return 1;
