@@ -27,13 +27,39 @@ elif _SYS == "darwin":
 else:
     TARGET = "x86_64-linux-gnu"
 
+_SHARP_ROOT_HELP = """\
+ERROR: SHARP_ROOT environment variable not set.
+
+Set SHARP_ROOT to your sharp installation root.  Expected layout:
+
+  sharpc/:
+    bin  std  zig
+
+  sharpc/bin:
+    sharpc.exe  spkg.exe
+
+  sharpc/std:
+    cjson.sp  cjson.sph  hashmap.sph  str.sph  string.sph  types.sph  vec.sph
+
+  sharpc/zig:
+    LICENSE  README.md  doc  lib  zig.exe
+
+Example:
+  set SHARP_ROOT=C:\\path\\to\\env\\sharpc
+"""
+
+if "SHARP_ROOT" not in os.environ:
+    sys.exit(_SHARP_ROOT_HELP)
+
+_SHARP_ROOT = Path(os.environ["SHARP_ROOT"])
+
 if _SYS == "win32":
-    ZIG = str(ROOT / ".." / ".." / "env" / "sharpc" / "zig" / "zig.exe")
+    ZIG = str(_SHARP_ROOT / "zig" / "zig.exe")
     OBJ_EXT = ".o"
     EXE_EXT = ".exe"
     LINK_FLAGS = ["-lshlwapi", "-lws2_32", "-lwinhttp", "-lrpcrt4", "-lcrypt32", "-lsecur32", "-static"]
 else:
-    ZIG = str(ROOT / ".." / ".." / "env" / "sharpc" / "zig" / "zig")
+    ZIG = str(_SHARP_ROOT / "zig" / "zig")
     OBJ_EXT = ".o"
     EXE_EXT = ""
     LINK_FLAGS = ["-lpthread", "-lm", "-ldl"]
@@ -136,15 +162,12 @@ def link_exe(objs, out_rel, extra_flags=None):
 
 
 def deploy_to_env(exe_path):
-    sharp_root = os.environ.get("SHARP_ROOT", "")
-    if sharp_root:
-        dst_dir = Path(sharp_root) / "bin"
-    else:
-        dst_dir = ROOT / ".." / ".." / "env" / "sharpc" / "bin"
-    if dst_dir.is_dir():
-        dst = dst_dir / exe_path.name
-        shutil.copy2(str(exe_path), str(dst))
-        print(f"  CP {exe_path.name} -> {dst}")
+    dst_dir = _SHARP_ROOT / "bin"
+    if not dst_dir.is_dir():
+        dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / exe_path.name
+    shutil.copy2(str(exe_path), str(dst))
+    print(f"  CP {exe_path.name} -> {dst}")
 
 
 def build_spkg():

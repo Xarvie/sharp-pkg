@@ -1228,15 +1228,7 @@ local function parse_depfile_output(raw, cflags)
 end
 
 local function find_zig()
-    local compiler = find_compiler()
-    if not compiler then return nil end
-    local exe_dir = compiler:match("(.*/)")
-    if not exe_dir then return nil end
-    local zig = exe_dir .. "zig"
-    if spkg.file_exists(zig) then return zig end
-    zig = exe_dir .. "../zig/zig"
-    if spkg.file_exists(zig) then return zig end
-    return nil
+    return spkg.find_zigcc()
 end
 
 -- Scan header dependencies using compiler tooling.

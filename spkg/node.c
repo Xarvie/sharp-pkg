@@ -711,11 +711,18 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    /* Auto-detect sharpc if not explicitly set */
+    /* Resolve sharpc from SHARP_ROOT if not explicitly set */
     static char sharpc_buf[PATH_MAX];
     if (strcmp(g_sharpc, "sharpc") == 0) {
         const char *found = find_sharpc_path(sharpc_buf, sizeof(sharpc_buf));
-        if (found) g_sharpc = found;
+        if (found) {
+            g_sharpc = found;
+        } else {
+            fprintf(stderr,
+                "ERROR: cannot find sharpc. Set SHARP_ROOT to your sharp "
+                "installation root (containing bin/sharpc, std/, zig/).\n");
+            return 1;
+        }
     }
 
     /* Start mongoose */
